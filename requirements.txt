@@ -8,3 +8,7 @@ xlrd>=2.0.2
 # Хранилище MySQL (modules/)
 PyMySQL>=1.1.0
 cryptography>=42.0.0
+
+# Прямое COM-подключение к 1С (V83.COMConnector) — только Windows,
+# на машине панели также нужна установленная платформа 1С той же разрядности
+pywin32>=306; platform_system == "Windows"

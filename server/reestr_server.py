@@ -1897,6 +1897,10 @@ def c1_open_connection(connect, timeout=COM_TIMEOUT):
             pass
         text = ' '.join(str(x) for x in e.args[:2]) if getattr(e, 'args', None) else str(e)
         low = text.lower()
+        if 'класс не зарегистрирован' in low or 'invalid class string' in low or '-2147221164' in low:
+            raise ValueError('Платформа 1С не установлена на этом компьютере: COM-класс V83.COMConnector не '
+                             'зарегистрирован. Установите платформу 1С той же разрядности, что и Python панели '
+                             '(достаточно компонента «COM-соединение» из дистрибутива платформы)') from e
         if 'не найдена' in low or 'not found' in low or '-2147' in low and 'база' in low:
             raise ValueError(f'База 1С не найдена по строке «{c1_hide_secret(connect)}» — проверьте путь и имя базы') from e
         if 'логин' in low or 'пользовател' in low or 'login' in low:
