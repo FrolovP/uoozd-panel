@@ -29,16 +29,20 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import sys
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ET
+import urllib.error
+import urllib.request
 import webbrowser
 from copy import copy
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit
 
 from docx import Document
 from docx.oxml import parse_xml
@@ -177,6 +181,11 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 # Комиссию и списки сотрудников администратор может менять в панели (Настройки → Справочники);
 # тогда они хранятся в «Панель — справочники.json» и значения выше — только начальные.
 ФАЙЛ_СПРАВОЧНИКОВ = 'Панель — справочники.json'
+# Подключения к базам 1С по OData (Администрирование → «Базы 1С (OData)»).
+ФАЙЛ_ОДATA = 'Панель — подключения 1С OData.json'
+ODATA_TIMEOUT = 20          # секунд на HTTP-запрос к 1С
+ODATA_PAGE = 50             # страница $top по умолчанию
+ODATA_MAX_ROWS = 5000       # максимум строк за один просмотр таблицы
 
 # Планировщик: через сколько дней после итогов договор считать «затянувшимся».
 ДОГОВОР_ЖДЁМ_ДНЕЙ = 20
@@ -1328,6 +1337,451 @@ def dirs_payload():
             'commission': [{'role': r, 'name': n, 'post': p} for r, n, p in commission()],
             'staff_oao': load_responsibles(), 'staff_opaiz': staff_opaiz(),
             'roles': ['Председатель комиссии', 'Заместитель председателя комиссии', 'Член комиссии', 'Секретарь комиссии']}
+
+
+# =====================================================================
+# БАЗЫ 1С ПО ODATA — раздел «Администрирование»
+# Хранение: «Панель — подключения 1С OData.json» в папке панели.
+# Записи вида: {"id": "имя_подключения", "name": "…", "base": "http://сервер/база/hs/odata",
+#               "entity": "ЗаказПокупателя", "login": "…", "password": "…",
+#               "filter": "", "orderby": "", "top": 50, "enabled": true,
+#               "created_at": "…", "updated_at": "…"}
+# Пароли лежат в JSON рядом с панелью — доступ к файлу должен быть только у сервера.
+# В поле last_check хранится результат последней проверки подключения:
+#   {"ok": true/false, "message": "что ответил сервер", "checked_at": "ISO-время"}
+# =====================================================================
+
+ODATA_SECRET_KEYS = ('password',)
+CONN_TEST_TIMEOUT = 12       # секунд на проверку подключения (быстрый отклик в таблице)
+_odata_lock = threading.Lock()
+
+
+def odata_load_raw():
+    rows = _json_file(ФАЙЛ_ОДATA, [])
+    return rows if isinstance(rows, list) else []
+
+
+def odata_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ОДATA, json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def odata_public(rec):
+    """Для отправки в браузер: без пароля, с признаком «пароль задан» и последней проверкой."""
+    out = {k: rec.get(k) for k in ('id', 'name', 'base', 'entity', 'login', 'filter', 'orderby', 'top', 'enabled',
+                                   'ignore_cert', 'created_at', 'updated_at', 'last_check')}
+    out['has_password'] = bool(rec.get('password'))
+    return out
+
+
+def _conn_http_probe(base, login, password, ignore_cert, timeout):
+    """Один GET к корню OData-адреса 1С с basic-доступом. Бросает ValueError с текстом ошибки."""
+    req = urllib.request.Request(base, headers={'Accept': 'application/json, application/xml;q=0.9, */*;q=0.5'})
+    if login:
+        token = base64.b64encode(f'{login}:{password}'.encode('utf-8')).decode('ascii')
+        req.add_header('Authorization', 'Basic ' + token)
+    ctx = None
+    if base.lower().startswith('https://') and ignore_cert:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            head = resp.read(2048).lstrip()[:200]
+            code = getattr(resp, 'status', None) or resp.getcode()
+    except urllib.error.HTTPError as e:
+        snippet = ''
+        try:
+            snippet = e.read(400).decode('utf-8', 'replace')
+        except Exception:
+            pass
+        if e.code in (401, 403):
+            raise ValueError(f'Доступ запрещён ({e.code} {e.reason}) — проверьте пользователя и пароль 1С') from e
+        raise ValueError(f'1С ответила {e.code} {e.reason}. {snippet[:200]}') from e
+    except urllib.error.URLError as e:
+        reason = getattr(e, 'reason', e)
+        if isinstance(reason, socket.timeout):
+            raise ValueError(f'Сервер не ответил за {timeout} сек — база 1С недоступна или адрес указан неверно') from e
+        raise ValueError(f'Сервер недоступен: {reason}') from e
+    except socket.timeout as e:
+        raise ValueError(f'Сервер не ответил за {timeout} сек — база 1С недоступна или адрес указан неверно') from e
+    except OSError as e:
+        raise ValueError(f'Ошибка соединения: {e}') from e
+    if not head:
+        raise ValueError('1С вернула пустой ответ — проверьте, опубликован ли OData-источник по этому адресу')
+    if not (head.startswith(b'<') or head.startswith(b'{')):
+        raise ValueError('Ответ 1С не похож на JSON/XML — проверьте адрес публикации OData')
+    return f'Сервер ответил HTTP {code}'
+
+
+def conn_check(base, login='', password='', ignore_cert=False, entity=''):
+    """Проверка подключения к базе 1С по введённым данным → {'ok', 'message', 'checked_at'}.
+
+    Сначала — доступность адреса; если задана таблица (набор данных OData), дополнительно
+    запрашивается $metadata: это подтверждает доступ и публикацию целиком."""
+    checked_at = datetime.now().isoformat(timespec='seconds')
+    res = {'ok': False, 'message': '', 'checked_at': checked_at}
+    try:
+        b = odata_norm_url(base)
+    except ValueError as e:
+        res['message'] = str(e)
+        return res
+    login = str(login or '').strip()
+    if not login and password:
+        res['message'] = 'Указан пароль без имени пользователя 1С — заполните оба поля или оставьте оба пустыми'
+        return res
+    try:
+        note = _conn_http_probe(b, login, password, bool(ignore_cert), CONN_TEST_TIMEOUT)
+    except ValueError as e:
+        res['message'] = str(e)
+        return res
+    ent = str(entity or '').strip()
+    if ent:
+        probe = {'base': b, 'login': login, 'password': password, 'ignore_cert': bool(ignore_cert)}
+        try:
+            sets = odata_service_info(probe)
+        except ValueError as e:
+            res['message'] = f'Адрес доступен ({note}), но $metadata не отвечает: {e}'
+            return res
+        names = [x.get('name') for x in sets]
+        res['message'] = f'Подключение работает: {note}, наборов данных в публикации — {len(names)}'
+        if ent not in names:
+            res['message'] += f'. Таблица «{ent}» в списке не найдена — проверьте её название'
+        else:
+            res['entities'] = names[:400]
+    else:
+        res['message'] = f'Подключение работает: {note}'
+    res['ok'] = True
+    return res
+
+
+def odata_conn_check(data, actor):
+    """POST /api/odata/check — проверка подключения по данным из формы (без сохранения).
+
+    Для уже сохранённого подключения подтягивает сохранённый пароль, если поле пароля
+    оставлено пустым (пользователь его не менял)."""
+    if not actor.get('admin'):
+        raise PermissionError('Проверка подключения доступна только администратору')
+    login = str(data.get('login') or '').strip()
+    password = str(data.get('password') or '')
+    old = odata_find(str(data.get('id') or '')) if data.get('id') else None
+    if not password and old and login == str(old.get('login') or '').strip():
+        password = str(old.get('password') or '')
+    return conn_check(data.get('base'), login, password, bool(data.get('ignore_cert')), data.get('entity'))
+
+
+def odata_save_last_check(conn_id, check):
+    """Запомнить результат проверки в записи подключения (колонка «Проверка» в таблице)."""
+    with _odata_lock:
+        rows = odata_load_raw()
+        hit = False
+        for x in rows:
+            if x.get('id') == conn_id:
+                x['last_check'] = check
+                hit = True
+        if hit:
+            odata_save_raw(rows)
+
+
+def odata_list_public():
+    return [odata_public(x) for x in odata_load_raw()]
+
+
+def odata_find(conn_id):
+    for x in odata_load_raw():
+        if x.get('id') == conn_id:
+            return x
+    return None
+
+
+def odata_norm_url(base):
+    """Проверка и нормализация адреса OData-источника 1С ( publication или расширениe hs/odata )."""
+    b = str(base or '').strip()
+    if not b:
+        raise ValueError('Не указан адрес базы 1С')
+    parts = urlsplit(b)
+    if parts.scheme not in ('http', 'https') or not parts.netloc:
+        raise ValueError('Адрес должен начинаться с http:// или https://')
+    if any(ch.isspace() for ch in b):
+        raise ValueError('В адресе не должно быть пробелов')
+    return b.rstrip('/') + '/'
+
+
+def odata_save_conn(data, actor):
+    """Создание/изменение подключения администратором."""
+    with _odata_lock:
+        rows = odata_load_raw()
+        cid = str(data.get('id') or '').strip()
+        if not cid:
+            cid = re.sub(r'[^a-z0-9_-]', '', str(data.get('name') or 'odata').lower())[:40] or 'odata'
+            base_id, n = cid, 2
+            while any(x.get('id') == cid for x in rows):
+                cid = f'{base_id}-{n}'
+                n += 1
+        old = next((x for x in rows if x.get('id') == cid), None)
+        name = str(data.get('name') or '').strip()
+        if not name:
+            raise ValueError('Название подключения обязательно')
+        rec = {
+            'id': cid,
+            'name': name[:120],
+            'base': odata_norm_url(data.get('base')),
+            'entity': str(data.get('entity') or '').strip()[:120],
+            'login': str(data.get('login') or '').strip()[:120],
+            'password': str(data.get('password') or '') if str(data.get('password') or '') else (old or {}).get('password', ''),
+            'filter': str(data.get('filter') or '').strip()[:1000],
+            'orderby': str(data.get('orderby') or '').strip()[:200],
+            'top': max(1, min(int(data.get('top') or ODATA_PAGE), 1000)),
+            'enabled': bool(data.get('enabled', True)),
+            'ignore_cert': bool(data.get('ignore_cert')),
+            'created_at': (old or {}).get('created_at') or datetime.now().isoformat(timespec='seconds'),
+            'updated_at': datetime.now().isoformat(timespec='seconds'),
+            'last_check': (old or {}).get('last_check'),
+        }
+        if old:
+            rows = [rec if x.get('id') == cid else x for x in rows]
+        else:
+            rows.append(rec)
+        odata_save_raw(rows)
+        log('edit', f"1С OData: подключение «{rec['name']}» сохранено", user=(actor or {}).get('fio') or 'панель')
+        return odata_public(rec)
+
+
+def odata_delete_conn(conn_id, actor):
+    with _odata_lock:
+        rows = odata_load_raw()
+        rec = next((x for x in rows if x.get('id') == conn_id), None)
+        if not rec:
+            raise ValueError('Подключение не найдено')
+        odata_save_raw([x for x in rows if x.get('id') != conn_id])
+        log('edit', f"1С OData: подключение «{rec['name']}» удалено", user=(actor or {}).get('fio') or 'панель')
+
+
+def _odata_http_get(url, rec):
+    """GET к 1С с basic-доступом; возвращает разобранный JSON."""
+    req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+    login, password = str(rec.get('login') or ''), str(rec.get('password') or '')
+    if login:
+        token = base64.b64encode(f'{login}:{password}'.encode('utf-8')).decode('ascii')
+        req.add_header('Authorization', 'Basic ' + token)
+    ctx = None
+    if url.lower().startswith('https://') and rec.get('ignore_cert'):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=ODATA_TIMEOUT, context=ctx) as resp:
+            payload = resp.read()
+    except urllib.error.HTTPError as e:
+        snippet = ''
+        try:
+            snippet = e.read(400).decode('utf-8', 'replace')
+        except Exception:
+            pass
+        raise ValueError(f'1С ответила {e.code} {e.reason}. {snippet[:200]}') from e
+    except urllib.error.URLError as e:
+        raise ValueError(f'База 1С недоступна: {e.reason}') from e
+    try:
+        return json.loads(payload.decode('utf-8', 'replace'))
+    except ValueError as e:
+        raise ValueError('Ответ 1С не похож на JSON — проверьте адрес OData') from e
+
+
+def _odata_meta_type(t):
+    return str(t or '').replace('Edm.', '')
+
+
+def odata_service_info(rec):
+    """$metadata → список доступных наборов данных (справочников/документов/регистров).
+
+    1С отдаёт $metadata в XML (CSDL), современные редакции — в JSON.
+    Разбираем оба формата; результат единый: [{'name','type','props','keys'}]."""
+    url = rec['base'] + '$metadata'
+    req = urllib.request.Request(url, headers={'Accept': 'application/json, application/xml;q=0.9, */*;q=0.5'})
+    login, password = str(rec.get('login') or ''), str(rec.get('password') or '')
+    if login:
+        token = base64.b64encode(f'{login}:{password}'.encode('utf-8')).decode('ascii')
+        req.add_header('Authorization', 'Basic ' + token)
+    ctx = None
+    if url.lower().startswith('https://') and rec.get('ignore_cert'):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=ODATA_TIMEOUT, context=ctx) as resp:
+            payload = resp.read()
+    except urllib.error.HTTPError as e:
+        snippet = ''
+        try:
+            snippet = e.read(400).decode('utf-8', 'replace')
+        except Exception:
+            pass
+        raise ValueError(f'1С ответила {e.code} {e.reason} на $metadata. {snippet[:200]}') from e
+    except urllib.error.URLError as e:
+        raise ValueError(f'База 1С недоступна: {e.reason}') from e
+    head = payload.lstrip()[:200]
+    if head.startswith(b'<') or b'edmx:' in head or b'Schema' in head:
+        sets = _odata_metadata_xml(payload)
+    else:
+        try:
+            j = json.loads(payload.decode('utf-8', 'replace'))
+        except ValueError as e:
+            raise ValueError('Ответ 1С на $metadata не похож ни на XML, ни на JSON — проверьте адрес OData') from e
+        sets = []
+        for et in (j.get('entityTypes') or []):
+            for es in (et.get('entitySets') or []):
+                props = [{'name': p.get('name'), 'type': _odata_meta_type(p.get('type')), 'nullable': p.get('nullable', True)}
+                         for p in (et.get('properties') or [])]
+                keys = ((et.get('keys') or [{}])[0].get('name') or '').split(',') if et.get('keys') else []
+                sets.append({'name': es.get('name'), 'type': et.get('name'), 'props': props,
+                             'keys': [k for k in keys if k]})
+    sets.sort(key=lambda x: (x.get('name') or '').lower())
+    return sets
+
+
+def _odata_metadata_xml(payload):
+    """CSDL/XML ($metadata 1С) → [{'name','type','props','keys'}]."""
+    def local(tag):
+        return tag.rsplit('}', 1)[-1]
+
+    try:
+        root = ET.fromstring(payload.decode('utf-8', 'replace'))
+    except (ET.ParseError, UnicodeDecodeError) as e:
+        raise ValueError('Не удалось разобрать $metadata 1С: ' + str(e)) from e
+    types = {}
+    for node in root.iter():
+        t = local(node.tag)
+        if t == 'EntityType':
+            name = node.get('Name') or ''
+            keys = [k.text or '' for ke in node if local(ke.tag) == 'Key'
+                    for k in ke if local(k.tag) == 'PropertyRef']
+            props = [{'name': p.get('Name'), 'type': _odata_meta_type(p.get('Type')),
+                      'nullable': str(p.get('Nullable', 'true')).lower() != 'false'}
+                     for p in node if local(p.tag) == 'Property']
+            types[name] = {'type': name, 'props': props, 'keys': [k for k in keys if k]}
+        elif t == 'EntitySet':
+            et = types.get(str(node.get('EntityType') or '').rsplit('.', 1)[-1])
+            if et is not None:
+                types[node.get('Name')] = dict(et, name=node.get('Name'))
+    return [dict(v, name=k) for k, v in types.items() if v.get('name')]
+
+
+def odata_query(rec, entity=None, filt=None, orderby=None, top=None, skip=0):
+    """Один запрос к набору данных 1С. → {'columns': [...], 'rows': [[...]], 'total': N}."""
+    ent = str(entity or rec.get('entity') or '').strip()
+    if not ent:
+        raise ValueError('Не выбрана таблица 1С (набор данных OData)')
+    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё0-9_.]+', ent):
+        raise ValueError('Некорректное имя набора данных')
+    params = ['$format=json']
+    f = str(filt if filt is not None else (rec.get('filter') or '')).strip()
+    if f:
+        params.append('$filter=' + quote(f, safe="()<>!=~,'&|.:-+*/% "))
+    ob = str(orderby if orderby is not None else (rec.get('orderby') or '')).strip()
+    if ob:
+        params.append('$orderby=' + quote(ob, safe=',. -'))
+    t = int(top if top else ODATA_PAGE)
+    params.append('$top=' + str(max(1, min(t, ODATA_MAX_ROWS))))
+    if skip:
+        params.append('$skip=' + str(int(skip)))
+    j = _odata_http_get(rec['base'] + ent + '?' + '&'.join(params), rec)
+    items = j.get('value') or []
+    columns, seen = [], set()
+    for it in items:
+        for k in it.keys():
+            if k not in seen and not k.endswith('_odata_bind'):
+                seen.add(k)
+                columns.append(k)
+    rows = [[_odata_cell(it.get(c)) for c in columns] for it in items]
+    total = j.get('@odata.count')
+    if total is None:
+        total = len(items) + int(skip or 0)
+    return {'columns': columns, 'rows': rows, 'total': total, 'entity': ent}
+
+
+def _odata_cell(v):
+    """Значения 1С (в т.ч. ссылки {...odata_bind}) приводим к тексту для таблицы."""
+    if v is None:
+        return ''
+    if isinstance(v, dict):
+        return v.get('Description') or v.get('Value') or v.get('RefKey') or v.get('PredefinedCode') or ''
+    if isinstance(v, bool):
+        return 'Да' if v else 'Нет'
+    if isinstance(v, (int, float)):
+        return v
+    s = str(v)
+    m = re.match(r'^/Date\((-?\d+)\)/$', s)
+    if m:
+        try:
+            return datetime.fromtimestamp(int(m.group(1)) / 1000).strftime('%d.%m.%Y %H:%M')
+        except (ValueError, OSError):
+            return s
+    return s
+
+
+def odata_api(path, data, user):
+    """Эндпоинты раздела: POST /api/odata/…  (все — только для администратора)."""
+    if not user.get('admin'):
+        raise PermissionError('Раздел «Базы 1С (OData)» доступен только администратору')
+    if path == '/api/odata/list':
+        return {'ok': True, 'items': odata_list_public()}
+    if path == '/api/odata/save':
+        return {'ok': True, 'item': odata_save_conn(data, user)}
+    if path == '/api/odata/delete':
+        odata_delete_conn(str(data.get('id') or ''), user)
+        return {'ok': True}
+    rec = odata_find(str(data.get('id') or ''))
+    if not rec:
+        raise ValueError('Подключение не найдено')
+    if path == '/api/odata/check':
+        return {'ok': True, **odata_conn_check(data, user)}
+    if path == '/api/odata/test':
+        try:
+            sets = odata_service_info(rec)
+            check = {'ok': True, 'message': f'Соединение установлено, наборов данных: {len(sets)}',
+                     'checked_at': datetime.now().isoformat(timespec='seconds')}
+        except (ValueError, PermissionError) as e:
+            sets = []
+            check = {'ok': False, 'message': str(e),
+                     'checked_at': datetime.now().isoformat(timespec='seconds')}
+            odata_save_last_check(rec['id'], check)
+            log('error', f"1С OData: проверка «{rec['name']}» — {check['message']}", user=user.get('fio') or 'панель')
+            raise ValueError(check['message']) from e
+        odata_save_last_check(rec['id'], check)
+        log('info', f"1С OData: проверка «{rec['name']}» — {check['message']}", user=user.get('fio') or 'панель')
+        return {'ok': True, **check, 'entities': [s['name'] for s in sets][:400]}
+    if path == '/api/odata/entities':
+        return {'ok': True, 'entities': odata_service_info(rec)}
+    if path == '/api/odata/query':
+        if not rec.get('enabled'):
+            raise ValueError('Подключение отключено администратором')
+        res = odata_query(rec, data.get('entity'), data.get('filter'), data.get('orderby'),
+                          data.get('top'), int(data.get('skip') or 0))
+        log('info', f"1С OData: «{rec['name']}» запрошена таблица {res['entity']} ({len(res['rows'])} строк)",
+            user=user.get('fio') or 'панель')
+        return {'ok': True, **res}
+    if path == '/api/odata/xlsx':
+        if not rec.get('enabled'):
+            raise ValueError('Подключение отключено администратором')
+        res = odata_query(rec, data.get('entity'), data.get('filter'), data.get('orderby'),
+                          max(int(data.get('top') or 0), 5000), 0)
+        return {'ok': True, 'file_b64': base64.b64encode(odata_xlsx_bytes(res)).decode('ascii'),
+                'name': f"1С — {res['entity']} — {date.today():%d.%m.%Y}.xlsx", 'rows': len(res['rows'])}
+    raise ValueError('Нет такой команды 1С OData')
+
+
+def odata_xlsx_bytes(res):
+    """Выгрузка результата OData-запроса в .xlsx (openpyxl)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (res.get('entity') or 'OData')[:31]
+    ws.append(res.get('columns') or [])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for row in res.get('rows') or []:
+        ws.append(row)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def load_responsibles():
@@ -8225,6 +8679,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(404, {'ok': False, 'message': 'Нет такой команды'})
             elif path == '/api/dirs':
                 self.send_json(200, {'ok': True, **dirs_payload()})
+            elif path.startswith('/api/odata/'):
+                self.send_json(200, odata_api(path, data, user))
             elif path == '/api/dirs/save':
                 if not user.get('admin'):
                     self.send_json(403, {'ok': False, 'message': 'Справочники меняет администратор'})
@@ -8331,7 +8787,9 @@ class Handler(BaseHTTPRequestHandler):
         log('error', f'Ошибка сервера: {type(e).__name__}: {e}')
         traceback.print_exc()
         try:
-            if isinstance(e, ValueError):
+            if isinstance(e, PermissionError):
+                self.send_json(403, {'ok': False, 'message': str(e)})
+            elif isinstance(e, ValueError):
                 # ValueError — осознанные сообщения для пользователя («Нет доступа…», «Файл не найден»)
                 self.send_json(500, {'ok': False, 'message': str(e)})
             else:
@@ -10201,6 +10659,24 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <div><button class="btn primary" id="dirSave">Сохранить справочники</button></div>
     </div>
   </section>
+  <section class="card" style="margin-top:16px">
+    <h2>Подключение к 1С <span class="muted">подключения видят и настраивают только администраторы</span></h2>
+    <div class="toolbar"><span class="muted">Публикации 1С по протоколу OData (адрес вида http://сервер/база/odata или …/hs/odata). Подключения хранятся в папке панели; пароль в браузер не отдаётся.</span><span class="grow"></span><button class="btn primary" id="odAdd">+ Подключение</button></div>
+    <div class="tablewrap"><table class="at" id="odTable"></table></div>
+    <div class="warnbox" id="odListWarn" style="margin:8px 0 0"></div>
+  </section>
+  <section class="card" style="margin-top:16px" id="odQueryCard" hidden>
+    <h2>Запрос к выбранному подключению <span class="muted" id="odConnName"></span></h2>
+    <div class="fgrid" style="gap:8px 12px;margin-bottom:8px">
+      <div class="f"><label>Таблица 1С (набор данных)</label><select id="odEntity"></select></div>
+      <div class="f"><label>$filter — условие отбора (OData)</label><input id="odFilter" placeholder="например, СуммаДокумента gt 100000"></div>
+      <div class="f"><label>$orderby — сортировка</label><input id="odOrderby" placeholder="например, Дата desc"></div>
+      <div class="f"><label>Строк на страницу</label><input id="odTop" inputmode="numeric" value="50"></div>
+    </div>
+    <div class="toolbar"><button class="btn primary" id="odRun">Запросить</button><button class="btn" id="odXlsx">Выгрузить в Excel</button><span class="muted" id="odInfo"></span><span class="grow"></span><button class="btn sm" id="odPrev">← предыдущая страница</button><button class="btn sm" id="odNext">следующая страница →</button></div>
+    <div class="warnbox" id="odWarn" style="margin:0 0 8px"></div>
+    <div class="tablewrap"><table class="at" id="odResult"></table></div>
+  </section>
 </div>
 </div>
 
@@ -10435,6 +10911,27 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <label class="chk full"><input type="checkbox" id="umDel"> может удалять записи из реестра</label>
     </div>
     <div class="sheet-foot"><button class="btn" id="umDelete">Удалить пользователя</button><span class="grow"></span><button class="btn primary" id="umSave">Сохранить</button></div>
+  </div>
+</div>
+
+<!-- ПОДКЛЮЧЕНИЕ 1С ODATA -->
+<div class="modal" id="odm" role="dialog" aria-modal="true" aria-labelledby="odmTitle">
+  <div class="sheet" style="width:min(640px,100%)">
+    <div class="sheet-head"><h2 id="odmTitle">Подключение к базе 1С</h2><button class="btn x" data-close="odm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="odmWarn"></div>
+    <div style="padding:14px 22px" class="fgrid">
+      <div class="f full"><label for="odmName">Название подключения</label><input id="odmName" placeholder="например, 1С БГУ — основная" autocomplete="off"></div>
+      <div class="f full"><label for="odmBase">Адрес OData публикации 1С <span class="req">*</span></label><input id="odmBase" placeholder="http://сервер/база/odata/" autocomplete="off"><div class="hint">или расширение …/hs/odata; панель обратится к адресу и к $metadata</div></div>
+      <div class="f"><label for="odmEntity">Таблица по умолчанию (набор данных)</label><input id="odmEntity" placeholder="например, ЗаказПокупателя" autocomplete="off"></div>
+      <div class="f"><label for="odmTop">Строк на страницу</label><input id="odmTop" inputmode="numeric" value="50"></div>
+      <div class="f"><label for="odmLogin">Пользователь 1С (basic)</label><input id="odmLogin" autocomplete="off"></div>
+      <div class="f"><label for="odmPass">Пароль</label><input id="odmPass" type="password" autocomplete="new-password"><div class="hint" id="odmPassHint"></div></div>
+      <div class="f full"><label for="odmFilter">Фильтр по умолчанию ($filter)</label><input id="odmFilter" placeholder="можно оставить пустым"></div>
+      <div class="f full"><label for="odmOrderby">Сортировка по умолчанию ($orderby)</label><input id="odmOrderby" placeholder="например, Дата desc"></div>
+      <label class="chk full"><input type="checkbox" id="odmEnabled"> подключение включено (пока выключено — запросы к нему запрещены)</label>
+      <label class="chk full"><input type="checkbox" id="odmIgnoreCert"> не проверять сертификат при https (для самоподписанных)</label>
+    </div>
+    <div class="sheet-foot"><button class="btn" id="odmDelete">Удалить подключение</button><button class="btn" id="odmCheck">Проверить подключение</button><span class="grow"></span><button class="btn primary" id="odmSave">Сохранить</button></div>
   </div>
 </div>
 
@@ -15567,6 +16064,142 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       if (!res.ok) { warnIn('dirWarn', 'err', esc(res.message)); return; }
       warnIn('dirWarn', ''); DIR = res; renderDirs(); toast('Справочники сохранены'); load();
     });
+  };
+
+  // --- Базы 1С (OData) — Администрирование, только администратор ---
+  var OD = { list: [], id: '', entities: {}, skip: 0, columns: [], rows: [], total: 0, entity: '' };
+  function odConn(id) { return OD.list.filter(function (x) { return x.id === id; })[0] || null; }
+  function loadOdata() {
+    if (!(AUTH.user && AUTH.user.admin)) return;
+    api('/api/odata/list', {}).then(function (res) {
+      if (!res.ok) { $('odTable').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message || 'Нет доступа') + '</td></tr></tbody>'; return; }
+      OD.list = res.items || [];
+      renderOdataConns();
+    });
+  }
+  function renderOdataConns() {
+    $('odTable').innerHTML = '<thead><tr><th>Название</th><th>Адрес OData</th><th>Таблица по умолчанию</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
+      (OD.list.length ? OD.list.map(function (x) {
+        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td><td class="l">' + esc(x.base) + '</td><td>' + esc(x.entity || '—') + '</td>' +
+          '<td>' + (x.login ? esc(x.login) : 'анонимно') + (x.has_password ? ' <span class="pill ok">пароль задан</span>' : '') + '</td>' +
+          '<td>' + (x.enabled ? '<span class="pill ok">включено</span>' : '<span class="pill warn">выключено</span>') + '</td>' +
+          '<td style="white-space:nowrap"><button class="btn sm" data-odtest="' + esc(x.id) + '">Проверить</button> ' +
+          '<button class="btn sm' + (x.enabled ? ' primary' : '') + '" data-odq="' + esc(x.id) + '">Запрос</button> ' +
+          '<button class="btn sm" data-odedit="' + esc(x.id) + '">Изменить</button></td></tr>';
+      }).join('') : '<tr><td colspan="6" class="empty">Подключений пока нет — нажмите «+ Подключение».</td></tr>') + '</tbody>';
+  }
+  $('odAdd').onclick = function () { openOdataConn(null); };
+  $('odTable').onclick = function (e) {
+    var t = e.target.closest('[data-odtest]'), q = e.target.closest('[data-odq]'), ed = e.target.closest('[data-odedit]');
+    if (t) odataTest(t.dataset.odtest);
+    else if (q) odataOpenQuery(q.dataset.odq);
+    else if (ed) openOdataConn(odConn(ed.dataset.odedit));
+  };
+  function openOdataConn(x) {
+    OD.editing = x ? x.id : '';
+    $('odmName').value = x ? x.name : ''; $('odmBase').value = x ? x.base : ''; $('odmEntity').value = x ? (x.entity || '') : '';
+    $('odmLogin').value = x ? (x.login || '') : ''; $('odmPass').value = '';
+    $('odmPassHint').textContent = x && x.has_password ? 'пароль сохранён — оставьте пустым, чтобы не менять' : '';
+    $('odmFilter').value = x ? (x.filter || '') : ''; $('odmOrderby').value = x ? (x.orderby || '') : '';
+    $('odmTop').value = x ? (x.top || 50) : 50;
+    $('odmEnabled').checked = x ? !!x.enabled : true; $('odmIgnoreCert').checked = !!(x && x.ignore_cert);
+    $('odmDelete').style.display = x ? '' : 'none'; $('odmDelete').dataset.confirm = ''; $('odmDelete').textContent = 'Удалить подключение';
+    warnIn('odmWarn', ''); openModal('odm');
+  }
+  $('odmSave').onclick = function () {
+    var d = { id: OD.editing, name: $('odmName').value.trim(), base: $('odmBase').value.trim(), entity: $('odmEntity').value.trim(),
+      login: $('odmLogin').value.trim(), password: $('odmPass').value, filter: $('odmFilter').value.trim(),
+      orderby: $('odmOrderby').value.trim(), top: +$('odmTop').value || 50, enabled: $('odmEnabled').checked, ignore_cert: $('odmIgnoreCert').checked };
+    api('/api/odata/save', d).then(function (res) {
+      if (!res.ok) { warnIn('odmWarn', 'err', esc(res.message)); return; }
+      closeModal('odm'); toast('Подключение сохранено'); loadOdata();
+      if (OD.id === res.item.id) odataOpenQuery(res.item.id);
+    });
+  };
+  $('odmDelete').onclick = function () {
+    if (this.dataset.confirm !== OD.editing) { this.dataset.confirm = OD.editing; this.textContent = 'Точно удалить?'; return; }
+    api('/api/odata/delete', { id: OD.editing }).then(function (res) {
+      if (!res.ok) { warnIn('odmWarn', 'err', esc(res.message)); return; }
+      closeModal('odm'); toast('Подключение удалено');
+      if (OD.id === OD.editing) { OD.id = ''; $('odQueryCard').hidden = true; }
+      loadOdata();
+    });
+  };
+  function odataTest(id) {
+    warnIn('odListWarn', '', 'Проверяю соединение с «' + esc((odConn(id) || {}).name || '') + '»…');
+    api('/api/odata/test', { id: id }).then(function (res) {
+      if (!res.ok) { warnIn('odListWarn', 'err', esc(res.message)); return; }
+      warnIn('odListWarn', '', '✓ ' + esc(res.message) + ' — можно выбирать таблицы в блоке «Запрос» ниже.');
+    });
+  }
+  function odataOpenQuery(id) {
+    var x = odConn(id); if (!x) return;
+    OD.id = id; OD.skip = 0; OD.entities = {};
+    $('odQueryCard').hidden = false; $('odConnName').textContent = '— ' + x.name + ' (' + x.base + ')';
+    $('odFilter').value = x.filter || ''; $('odOrderby').value = x.orderby || ''; $('odTop').value = x.top || 50;
+    $('odResult').innerHTML = '<tbody><tr><td class="empty">читаю список таблиц из $metadata…</td></tr></tbody>';
+    $('odInfo').textContent = ''; warnIn('odWarn', '');
+    api('/api/odata/entities', { id: id }).then(function (res) {
+      if (!res.ok) { $('odResult').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message) + '</td></tr></tbody>'; return; }
+      OD.entities = {};
+      (res.entities || []).forEach(function (s) { OD.entities[s.name] = s; });
+      var names = (res.entities || []).map(function (s) { return s.name; });
+      $('odEntity').innerHTML = names.map(function (n) { return '<option' + (n === x.entity ? ' selected' : '') + '>' + esc(n) + '</option>'; }).join('') || '<option value="">(нет наборов данных)</option>';
+      if (!names.length) $('odResult').innerHTML = '<tbody><tr><td class="empty">$metadata не вернул ни одного набора данных — опубликуйте OData в 1С.</td></tr></tbody>';
+      else if (x.entity) odataRun();
+    });
+  }
+  function odataParams(skip) {
+    return { id: OD.id, entity: $('odEntity').value, filter: $('odFilter').value.trim(), orderby: $('odOrderby').value.trim(),
+      top: +$('odTop').value || 50, skip: skip || 0 };
+  }
+  function odataRun() {
+    if (!OD.id) return;
+    OD.skip = Math.max(0, +$('odTop').value || 50) > 0 && this && this.btn === 'next' ? OD.skip + (+$('odTop').value || 50) : (this && this.btn === 'prev' ? Math.max(0, OD.skip - (+$('odTop').value || 50)) : 0);
+    $('odResult').innerHTML = '<tbody><tr><td class="empty">запрос к 1С…</td></tr></tbody>';
+    warnIn('odWarn', '');
+    api('/api/odata/query', odataParams(OD.skip)).then(function (res) {
+      if (!res.ok) { $('odResult').innerHTML = '<tbody></tbody>'; warnIn('odWarn', 'err', esc(res.message)); return; }
+      OD.columns = res.columns || []; OD.rows = res.rows || []; OD.total = res.total || 0; OD.entity = res.entity;
+      var shown = OD.columns.slice(0, 24);
+      $('odResult').innerHTML = '<thead><tr>' + shown.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
+        (OD.rows.length ? OD.rows.slice(0, 500).map(function (r) {
+          return '<tr>' + shown.map(function (c) { return '<td class="l">' + esc(r[OD.columns.indexOf(c)]) + '</td>'; }).join('') + '</tr>';
+        }).join('') : '<tr><td colspan="' + Math.max(1, shown.length) + '" class="empty">нет строк по этому фильтру</td></tr>') + '</tbody>';
+      $('odInfo').textContent = 'строк на странице: ' + OD.rows.length + (OD.total ? ' · всего по оценке: ' + OD.total : '') +
+        (OD.columns.length > 24 ? ' · колонок: ' + OD.columns.length + ', показаны первые 24' : '');
+    });
+  }
+  $('odRun').onclick = function () { odataRun.call({}); };
+  $('odPrev').onclick = function () { var t = +$('odTop').value || 50; OD.skip = Math.max(0, OD.skip - t); odataParamsRender(); };
+  $('odNext').onclick = function () { var t = +$('odTop').value || 50; OD.skip = OD.skip + t; odataParamsRender(); };
+  function odataParamsRender() {
+    $('odResult').innerHTML = '<tbody><tr><td class="empty">запрос к 1С…</td></tr></tbody>';
+    api('/api/odata/query', odataParams(OD.skip)).then(function (res) {
+      if (!res.ok) { warnIn('odWarn', 'err', esc(res.message)); $('odResult').innerHTML = '<tbody></tbody>'; return; }
+      OD.columns = res.columns || []; OD.rows = res.rows || []; OD.total = res.total || 0;
+      var shown = OD.columns.slice(0, 24);
+      $('odResult').innerHTML = '<thead><tr>' + shown.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
+        (OD.rows.length ? OD.rows.slice(0, 500).map(function (r) {
+          return '<tr>' + shown.map(function (c) { return '<td class="l">' + esc(r[OD.columns.indexOf(c)]) + '</td>'; }).join('') + '</tr>';
+        }).join('') : '<tr><td colspan="' + Math.max(1, shown.length) + '" class="empty">нет строк</td></tr>') + '</tbody>' +
+        '<caption class="muted">страница: skip=' + OD.skip + ' · строка с ' + (OD.skip + 1) + '</caption>';
+      $('odInfo').textContent = 'строк на странице: ' + OD.rows.length + (OD.total ? ' · всего по оценке: ' + OD.total : '');
+    });
+  }
+  $('odXlsx').onclick = function () {
+    if (!OD.id) return;
+    api('/api/odata/xlsx', odataParams(0)).then(function (res) {
+      if (!res.ok) { warnIn('odWarn', 'err', esc(res.message)); return; }
+      var a = document.createElement('a');
+      a.href = 'data:xlsx;base64,' + res.file_b64; a.download = res.name || '1С-OData.xlsx';
+      document.body.appendChild(a); a.click(); a.remove();
+      toast('Выгружено строк: ' + res.rows);
+    });
+  };
+  $('odEntity').onchange = function () {
+    var s = OD.entities[this.value];
+    $('odFilter').placeholder = s && s.props && s.props.length ? 'поля: ' + s.props.slice(0, 30).map(function (p) { return p.name; }).join(', ') : 'например, СуммаДокумента gt 100000';
   };
   // дополнительный член комиссии — только для этого протокола
   $('pm_extra_add').onclick = function () {
