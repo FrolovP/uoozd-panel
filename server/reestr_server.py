@@ -1729,11 +1729,13 @@ def odata_api(path, data, user):
     if path == '/api/odata/delete':
         odata_delete_conn(str(data.get('id') or ''), user)
         return {'ok': True}
+    if path == '/api/odata/check':
+        # проверка по данным формы — сохранённая запись не нужна:
+        # если указан id, odata_conn_check сам подтянет сохранённый пароль
+        return {'ok': True, **odata_conn_check(data, user)}
     rec = odata_find(str(data.get('id') or ''))
     if not rec:
         raise ValueError('Подключение не найдено')
-    if path == '/api/odata/check':
-        return {'ok': True, **odata_conn_check(data, user)}
     if path == '/api/odata/test':
         try:
             sets = odata_service_info(rec)
@@ -1770,13 +1772,15 @@ def odata_api(path, data, user):
 
 
 # =====================================================================
-# БАЗЫ 1С БЕЗ ВЕБ-ПУБЛИКАЦИИ — прямой COM-запуск 1С (технологический сервер)
+# БАЗЫ 1С БЕЗ ВЕБ-ПУБЛИКАЦИИ — прямое COM-соединение (V83.COMConnector)
 # Второй вариант подключения для баз, которые не опубликованы как OData:
-# панель (Windows-сервер с установленной 1С) открываетEnterpriseConnector
-# по строке соединения («файл», «localhost», «сервер/база» + пароль доступа)
-# и вызывает общий модуль 1С через COM-соединение. Требует pywin32
-# (pythoncom) на машине панели; на Linux/Mac раздел показывает подсказку
-# и позволяет завести/проверить параметры подключения.
+# панель (Windows-сервер с установленной платформой 1С той же разрядности,
+# что и Python) открывает соединение по строке вида
+#   File="C:\Базы\Закупки";Usr="Имя";Pwd="пароль";           — файловая база
+#   Srvr="srv1c:1541";Ref="Закупки";Usr="Имя";Pwd="пароль";  — клиент-серверная
+# и вызывает общий модуль 1С через COM. Требует pywin32 (pythoncom) на машине
+# панели; на Linux/Mac раздел показывает подсказку и позволяет завести/проверить
+# параметры подключения.
 # Хранение: «Панель — подключения 1С прямые.json». Пароль доступа хранится
 # рядом с панелью — доступ к файлу должен быть только у сервера.
 # =====================================================================
@@ -1800,52 +1804,59 @@ def c1_public(rec):
     out = {k: rec.get(k) for k in ('id', 'name', 'base', 'server', 'user', 'desc', 'module', 'method', 'param',
                                    'enabled', 'created_at', 'updated_at', 'last_check')}
     out['connect'] = c1_hide_secret(rec.get('connect'))
-    out['has_password'] = bool(rec.get('password')) or ',' in str(rec.get('connect') or '')
+    out['has_password'] = bool(rec.get('password')) or bool(c1_split_password(rec.get('connect')))
     return out
 
 
 def c1_form_data(rec):
     """Что подставить в форму при повторной проверке/вызове (без Pwd из строки)."""
     d = c1_public(rec)
-    connect = str(rec.get('connect') or '')
-    if ',Pwd=' in connect:
-        head = connect.split(',Pwd=')[0]
-        tail = connect[len(head) + 5:]
-        if tail.startswith(('Usr=', 'License=', 'Debug')):
-            connect = f'{head},{tail}'
-        else:
-            connect = head
+    connect = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', str(rec.get('connect') or ''), flags=re.IGNORECASE)
     d['connect'] = connect
-    d['password'] = str(rec.get('password') or '')
+    d['password'] = str(rec.get('password') or '') or c1_split_password(str(rec.get('connect') or ''))
     return d
 
 
 def c1_norm_connect(s):
-    """Строка соединения 1С → нормализованный вид '<вид><данные>,Pwd=<пароль>' или '<вид><данные>'.
+    """Строка соединения V83.COMConnector → нормализованный вид с кавычками и «;» в конце.
 
-    Секрет доступа из хвоста строки («File=…\\1CV8,секрет») переносится в Pwd= — иначе 1С
-    принимает его за имя базы."""
-    t = str(s or '').strip().rstrip(',')
+    Реальный формат COM-соединителя 1С:
+      файловая база        File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль";
+      клиент-серверная     Srvr="srv1c:1541";Ref="ИмяБазы";Usr="Имя";Pwd="пароль";
+    Значения принимаются в кавычках и без; параметры пересобираются в канонический вид."""
+    t = str(s or '').strip().rstrip(';').strip()
     if not t:
         raise ValueError('Не указана строка соединения с базой 1С')
-    low = t.lower()
-    if not any(low.startswith(p) for p in ('file=', 'filew=', 'dbn=', 'postgres', 'mysql', 'oracle', 'sqlserver',
-                                           'managedserver=', 'comcntr=', 'ws=')):
-        raise ValueError('Строка должна начинаться с File=…, ManagedServer=…, Comcntr=… или DbNch=… — как в конфиге 1С')
-    if ',' in t:
-        head, tail = t.rsplit(',', 1)
-        tl = tail.strip().lower()
-        if tail.strip() and not tl.startswith(('usr=', 'pwd=', 'license=', 'debug')):
-            t = f'{head},Pwd={tail.strip()}'
-    return t
+    pairs = []
+    pos = 0
+    for m in re.finditer(r'(\w+)\s*=\s*(?:"([^"]*)"|([^;]*))', t):
+        if t[pos:m.start()].strip(' ;'):
+            raise ValueError('Строка соединения должна быть вида File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль"; '
+                             'или Srvr="сервер";Ref="имя базы";Usr="Имя";Pwd="пароль";')
+        if m.group(2) is None and ',' in (m.group(3) or ''):
+            raise ValueError('Похоже на строку старого формата с запятыми. COM-соединитель 1С принимает параметры '
+                             'через «;»: File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль";')
+        pairs.append((m.group(1), m.group(2) if m.group(2) is not None else (m.group(3) or '').strip()))
+        pos = m.end()
+    if t[pos:].strip(' ;') or not pairs:
+        raise ValueError('Строка соединения должна быть вида File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль"; '
+                         'или Srvr="сервер";Ref="имя базы";Usr="Имя";Pwd="пароль";')
+    keys = [k.lower() for k, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError('В строке соединения параметр указан дважды')
+    if 'file' in keys:
+        pass
+    elif 'srvr' in keys and 'ref' in keys:
+        pass
+    else:
+        raise ValueError('Укажите File="путь к каталогу базы" (файловая база) или Srvr="сервер";Ref="имя базы" (клиент-серверная)')
+    return ';'.join(f'{k}="{v}"' for k, v in pairs) + ';'
 
 
 def c1_split_password(connect):
-    """Из строки соединения «File=…\\1CV8,secret» → секрет доступа (последний сегмент после запятой)."""
-    parts = str(connect or '').rsplit(',', 1)
-    if len(parts) == 2 and parts[1].strip() and 'password=' not in parts[1].lower():
-        return parts[1].strip()
-    return ''
+    """Из строки соединения 1С → значение Pwd="…" (пароль доступа), '' если пароля нет."""
+    m = re.search(r'Pwd\s*=\s*"([^"]*)"', str(connect or ''), flags=re.IGNORECASE)
+    return m.group(1) if m else ''
 
 
 def c1_is_windows():
@@ -1864,7 +1875,10 @@ def c1_com_available():
 def c1_open_connection(connect, timeout=COM_TIMEOUT):
     """Открывает EnterpriseConnector (COM) к базе 1С без веб-публикации.
 
-    Возвращает объект соединения; ошибки превращает в понятный текст."""
+    Возвращает объект соединения; ошибки превращает в понятный текст.
+    Вызывается из потока HTTP-сервера: COM в потоке инициализируется здесь
+    (CoInitialize), а освобождается вызывающим кодом — pythoncom.CoUninitialize()
+    после закрытия соединения."""
     try:
         import win32com.client
         import pythoncom
@@ -1872,10 +1886,15 @@ def c1_open_connection(connect, timeout=COM_TIMEOUT):
         raise ValueError('На компьютере панели не установлен pywin32 — прямой запуск 1С невозможен. '
                          'Установите: pip install pywin32 (нужна Windows с установленной платформой 1С)') from e
     connect = c1_norm_connect(connect)
+    pythoncom.CoInitialize()  # COM обязателен к инициализации в каждом потоке — сервер многопоточный
     try:
         coord = win32com.client.Dispatch('V83.COMConnector', clsctx=pythoncom.CLSCTX_LOCAL_SERVER)
         conn = coord.Connect(connect)
     except Exception as e:
+        try:
+            pythoncom.CoUninitialize()  # соединение не открылось — освобождаем COM в этом потоке
+        except Exception:
+            pass
         text = ' '.join(str(x) for x in e.args[:2]) if getattr(e, 'args', None) else str(e)
         low = text.lower()
         if 'не найдена' in low or 'not found' in low or '-2147' in low and 'база' in low:
@@ -1891,15 +1910,17 @@ def c1_open_connection(connect, timeout=COM_TIMEOUT):
 
 
 def c1_hide_secret(connect):
-    """Строка соединения без секрета — для сообщений об ошибках и журнала."""
-    parts = str(connect or '').rsplit(',', 1)
-    if len(parts) == 2 and parts[1].strip():
-        return parts[0] + ',••••'
-    return str(connect or '')
+    """Строка соединения без секрета (Pwd="••••") — для сообщений об ошибках и журнала."""
+    return re.sub(r'(Pwd\s*=\s*")[^"]*(")', r'\1••••\2', str(connect or ''), flags=re.IGNORECASE)
 
 
 def c1_call(conn, module, method, param):
-    """Вызов общего модуля 1С: conn.<Module>().<Method>(param) → ответ."""
+    """Вызов общего модуля 1С через COM: conn.<Модуль>.<Метод>(param) → ответ.
+
+    Общий модуль — свойство объекта соединения (не функция): вызывать сам объект
+    модуля нельзя, метод берётся прямо с него. Чтобы модуль был доступен через
+    внешнее соединение, в конфигураторе у него должны стоять флаги «Сервер» и
+    «Внешнее соединение», а у процедуры/функции — признак «Экспорт»."""
     mod = str(module or '').strip()
     met = str(method or '').strip()
     if not re.fullmatch(r'[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*', mod):
@@ -1909,11 +1930,12 @@ def c1_call(conn, module, method, param):
     try:
         obj = getattr(conn, mod)
     except AttributeError as e:
-        raise ValueError(f'Общий модуль «{mod}» в конфигурации 1С не найден — проверьте имя модуля') from e
+        raise ValueError(f'Общий модуль «{mod}» в конфигурации 1С не найден или недоступен через внешнее соединение — '
+                         f'проверьте имя модуля и его флаги «Сервер»/«Внешнее соединение»') from e
     try:
-        fn = getattr(obj(), met)
+        fn = getattr(obj, met)
     except Exception as e:
-        raise ValueError(f'Модуль «{mod}» вызывается, но процедуры/функции «{met}» в нём нет: {str(e)[:200]}') from e
+        raise ValueError(f'Модуль «{mod}» доступен, но экспортной процедуры/функции «{met}» в нём нет: {str(e)[:200]}') from e
     try:
         res = fn(param) if str(param or '') != '' else fn()
     except Exception as e:
@@ -1935,25 +1957,28 @@ def c1_result_to_jsonable(v):
 
 
 def c1_assemble(data):
-    """Собрать строку соединения из полей формы: «файл/сервер + путь + имя базы» + секрет.
+    """Собрать строку соединения V83.COMConnector из полей формы.
 
-    Поддерживает и готовую строку в поле connect, и раздельные поля (для пользователей)."""
+    Готовая строка в поле connect имеет приоритет. Иначе: «сервер + имя базы»
+    → Srvr="сервер";Ref="база"; (клиент-серверная), только «путь к базе»
+    → File="путь"; (файловая). Пользователь и пароль добавляются параметрами
+    Usr="/Pwd=" — если их ещё нет в строке."""
     connect = str(data.get('connect') or '').strip()
-    base = str(data.get('base') or '').strip()
-    server = str(data.get('server') or '').strip()
-    user = str(data.get('user') or '').strip()
+    base = str(data.get('base') or '').strip().strip('"')
+    server = str(data.get('server') or '').strip().strip('"')
+    user = str(data.get('user') or '').strip().strip('"')
     password = str(data.get('password') or '')
     if not connect and base:
-        b = base.replace('\\', '/').rstrip('/')
-        name = b.rsplit('/', 1)[-1]
         if server:
-            connect = f'File={b},{name}'
+            connect = f'Srvr="{server}";Ref="{base}";'
         else:
-            connect = f'File="{b}",{name}'
-    if connect and user and 'Usr=' not in connect:
-        connect = connect.rstrip(',') + ',Usr=' + user
-    if connect and password and 'Pwd=' not in connect:
-        connect = connect.rstrip(',') + ',Pwd=' + password
+            connect = f'File="{base}";'
+    if connect:
+        low = connect.lower()
+        if user and not re.search(r'\busr\s*=', low):
+            connect = connect.rstrip(';').rstrip() + f';Usr="{user}";'
+        if password and not re.search(r'\bpwd\s*=', low):
+            connect = connect.rstrip(';').rstrip() + f';Pwd="{password}";'
     return connect
 
 
@@ -2005,8 +2030,10 @@ def c1_conn_check(data, actor):
     except ValueError as e:
         res['message'] = f'Соединение с базой установлено ✓, но {e}'
     finally:
+        conn = None  # у COM-соединения 1С нет метода Disconnect — оно закрывается освобождением объекта
         try:
-            conn.Disconnect()
+            import pythoncom
+            pythoncom.CoUninitialize()
         except Exception:
             pass
     return res
@@ -2052,6 +2079,9 @@ def c1_save_conn(data, actor):
             if saved_pw:
                 data['password'] = saved_pw
         connect = c1_norm_connect(c1_assemble(data))
+        pwd = str(data.get('password') or '') or c1_split_password(connect)
+        # секрет храним только в отдельном поле — в сохранённой строке соединения его быть не должно
+        connect = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', connect, flags=re.IGNORECASE)
         rec = {
             'id': cid,
             'name': name[:120],
@@ -2059,7 +2089,7 @@ def c1_save_conn(data, actor):
             'base': str(data.get('base') or '').strip()[:120],
             'server': str(data.get('server') or '').strip()[:120],
             'user': str(data.get('user') or '').strip()[:120],
-            'password': str(data.get('password') or ''),
+            'password': pwd,
             'desc': str(data.get('desc') or '').strip()[:300],
             'module': str(data.get('module') or '').strip()[:120],
             'method': str(data.get('method') or '').strip()[:120],
@@ -2133,8 +2163,10 @@ def c1_api(path, data, user):
             res = c1_call(conn, data.get('module') or rec.get('module'),
                           data.get('method') or rec.get('method'), data.get('param', rec.get('param')))
         finally:
+            conn = None  # COM-соединение закрывается освобождением объекта
             try:
-                conn.Disconnect()
+                import pythoncom
+                pythoncom.CoUninitialize()
             except Exception:
                 pass
         log('info', f"1С прямое: «{rec['name']}» вызван {data.get('module') or rec.get('module')}.{data.get('method') or rec.get('method')}",
@@ -11054,7 +11086,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <div class="tablewrap"><table class="at" id="odResult"></table></div>
   </section>
   <section class="card" style="margin-top:16px">
-    <h2>Подключение к 1С без веб-публикации <span class="muted">прямое COM-соединение с базой (File=…, ManagedServer=…)</span></h2>
+    <h2>Подключение к 1С без веб-публикации <span class="muted">прямое COM-соединение с базой (File="…";Usr="…" или Srvr="…";Ref="…")</span></h2>
     <div class="toolbar"><span class="muted" id="c1ModeHint">Для баз, которые не опубликованы как OData: панель обращается к базе напрямую через COM-соединение 1С. Работает на Windows-сервере панели с установленной платформой 1С.</span><span class="grow"></span><button class="btn primary" id="c1Add">+ Подключение</button></div>
     <div class="tablewrap"><table class="at" id="c1Table"></table></div>
     <div class="warnbox" id="c1ListWarn" style="margin:8px 0 0"></div>
@@ -11314,6 +11346,27 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <label class="chk full"><input type="checkbox" id="odmIgnoreCert"> не проверять сертификат при https (для самоподписанных)</label>
     </div>
     <div class="sheet-foot"><button class="btn" id="odmDelete">Удалить подключение</button><button class="btn" id="odmCheck">Проверить подключение</button><span class="grow"></span><button class="btn primary" id="odmSave">Сохранить</button></div>
+  </div>
+</div>
+
+<div class="modal" id="c1m" role="dialog" aria-modal="true" aria-labelledby="c1mTitle">
+  <div class="sheet" style="width:min(680px,100%)">
+    <div class="sheet-head"><h2 id="c1mTitle">Прямое подключение к базе 1С (COM)</h2><button class="btn x" data-close="c1m" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="c1mWarn"></div>
+    <div style="padding:14px 22px" class="fgrid">
+      <div class="f full"><label for="c1mName">Название подключения</label><input id="c1mName" placeholder="например, 1С БГУ — файловая копия" autocomplete="off"></div>
+      <div class="f full"><label for="c1mConnect">Готовая строка соединения</label><input id="c1mConnect" placeholder='File="C:\Базы\Закупки";Usr="Иванов"' autocomplete="off"><div class="hint">файловая база: File="путь к каталогу"; · клиент-серверная: Srvr="сервер";Ref="имя базы"; — можно оставить пустым и заполнить поля ниже</div></div>
+      <div class="f"><label for="c1mServer">Сервер 1С</label><input id="c1mServer" placeholder="srv1c:1541 — пусто = файловая база" autocomplete="off"></div>
+      <div class="f"><label for="c1mBase">Путь к базе / имя базы</label><input id="c1mBase" placeholder="C:\Базы\Закупки или имя на сервере" autocomplete="off"></div>
+      <div class="f"><label for="c1mUser">Пользователь 1С</label><input id="c1mUser" autocomplete="off"></div>
+      <div class="f"><label for="c1mPass">Пароль</label><input id="c1mPass" type="password" autocomplete="new-password"><div class="hint" id="c1mPassHint"></div></div>
+      <div class="f"><label for="c1mModule">Общий модуль 1С</label><input id="c1mModule" placeholder="например, УООЗД_Интеграция" autocomplete="off"></div>
+      <div class="f"><label for="c1mMethod">Экспортная функция/процедура</label><input id="c1mMethod" placeholder="например, ПроверитьСвязь" autocomplete="off"></div>
+      <div class="f full"><label for="c1mParam">Параметр вызова (строка)</label><input id="c1mParam" placeholder="можно оставить пустым" autocomplete="off"></div>
+      <div class="f full"><label for="c1mDesc">Комментарий</label><input id="c1mDesc" placeholder="зачем это подключение" autocomplete="off"></div>
+      <label class="chk full"><input type="checkbox" id="c1mEnabled"> подключение включено (пока выключено — вызовы к нему запрещены)</label>
+    </div>
+    <div class="sheet-foot"><button class="btn" id="c1mDelete">Удалить подключение</button><button class="btn" id="c1mCheck">Проверить подключение</button><span class="grow"></span><button class="btn primary" id="c1mSave">Сохранить</button></div>
   </div>
 </div>
 
@@ -12415,7 +12468,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     if (v === 'an') renderAnalytics();
     if (v === 'rep') renderReports();
     if (v === 'sup') loadSuppliers(true).then(renderSuppliers);
-    if (v === 'users') { loadUsers(); loadDirs(); }
+    if (v === 'users') { loadUsers(); loadDirs(); loadOdata(); loadC1(); }
     if (v === 'opaiz') renderOz();
     if (v === 'ovrk') renderOvrk();
     if (v === 'plan' || v === 'planDept') renderPlan();
@@ -16583,6 +16636,97 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     var s = OD.entities[this.value];
     $('odFilter').placeholder = s && s.props && s.props.length ? 'поля: ' + s.props.slice(0, 30).map(function (p) { return p.name; }).join(', ') : 'например, СуммаДокумента gt 100000';
   };
+
+  // --- Подключение к 1С без веб-публикации (COM) — Администрирование, только администратор ---
+  var C1 = { list: [], editing: '' };
+  function c1Conn(id) { return C1.list.filter(function (x) { return x.id === id; })[0] || null; }
+  function loadC1() {
+    if (!(AUTH.user && AUTH.user.admin)) return;
+    api('/api/c1/list', {}).then(function (res) {
+      if (!res.ok) { $('c1Table').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message || 'Нет доступа') + '</td></tr></tbody>'; return; }
+      C1.list = res.items || [];
+      $('c1ModeHint').textContent = res.com
+        ? 'Прямой запуск 1С доступен: на сервере панели есть pywin32 и установлена платформа 1С.'
+        : (res.windows
+          ? 'На сервере панели не установлен pywin32 (pip install pywin32) — прямой запуск 1С недоступен. Параметры можно завести заранее.'
+          : 'Панель работает не на Windows — прямой COM-запуск 1С недоступен, используйте подключения OData. Параметры можно завести заранее.');
+      renderC1Conns();
+    });
+  }
+  function renderC1Conns() {
+    $('c1Table').innerHTML = '<thead><tr><th>Название</th><th>Строка соединения</th><th>Модуль.Метод</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
+      (C1.list.length ? C1.list.map(function (x) {
+        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td><td class="l">' + esc(x.connect || '—') + '</td>' +
+          '<td>' + (x.module ? esc(x.module) + (x.method ? '.' + esc(x.method) : '') : '—') + '</td>' +
+          '<td>' + (x.user ? esc(x.user) : '—') + (x.has_password ? ' <span class="pill ok">пароль задан</span>' : '') + '</td>' +
+          '<td>' + (x.enabled ? '<span class="pill ok">включено</span>' : '<span class="pill warn">выключено</span>') +
+            (x.last_check ? '<br><span class="muted">' + (x.last_check.ok ? '✓ ' : '✕ ') + esc((x.last_check.checked_at || '').replace('T', ' ')) + '</span>' : '') + '</td>' +
+          '<td style="white-space:nowrap"><button class="btn sm" data-c1test="' + esc(x.id) + '">Проверить</button> ' +
+          (x.module && x.method ? '<button class="btn sm primary" data-c1call="' + esc(x.id) + '">Вызвать</button> ' : '') +
+          '<button class="btn sm" data-c1edit="' + esc(x.id) + '">Изменить</button></td></tr>';
+      }).join('') : '<tr><td colspan="6" class="empty">Подключений пока нет — нажмите «+ Подключение».</td></tr>') + '</tbody>';
+  }
+  $('c1Add').onclick = function () { openC1Conn(null); };
+  $('c1Table').onclick = function (e) {
+    var t = e.target.closest('[data-c1test]'), cl = e.target.closest('[data-c1call]'), ed = e.target.closest('[data-c1edit]');
+    if (t) c1Test(t.dataset.c1test);
+    else if (cl) c1Call(cl.dataset.c1call);
+    else if (ed) openC1Conn(c1Conn(ed.dataset.c1edit));
+  };
+  function openC1Conn(x) {
+    C1.editing = x ? x.id : '';
+    $('c1mName').value = x ? x.name : ''; $('c1mConnect').value = x ? (x.connect || '') : '';
+    $('c1mServer').value = x ? (x.server || '') : ''; $('c1mBase').value = x ? (x.base || '') : '';
+    $('c1mUser').value = x ? (x.user || '') : ''; $('c1mPass').value = '';
+    $('c1mPassHint').textContent = x && x.has_password ? 'пароль сохранён — оставьте пустым, чтобы не менять' : '';
+    $('c1mModule').value = x ? (x.module || '') : ''; $('c1mMethod').value = x ? (x.method || '') : '';
+    $('c1mParam').value = x ? (x.param || '') : ''; $('c1mDesc').value = x ? (x.desc || '') : '';
+    $('c1mEnabled').checked = x ? !!x.enabled : true;
+    $('c1mDelete').style.display = x ? '' : 'none'; $('c1mDelete').dataset.confirm = ''; $('c1mDelete').textContent = 'Удалить подключение';
+    warnIn('c1mWarn', ''); openModal('c1m');
+  }
+  function c1FormData() {
+    return { id: C1.editing, name: $('c1mName').value.trim(), connect: $('c1mConnect').value.trim(),
+      server: $('c1mServer').value.trim(), base: $('c1mBase').value.trim(), user: $('c1mUser').value.trim(),
+      password: $('c1mPass').value, module: $('c1mModule').value.trim(), method: $('c1mMethod').value.trim(),
+      param: $('c1mParam').value, desc: $('c1mDesc').value.trim(), enabled: $('c1mEnabled').checked };
+  }
+  $('c1mSave').onclick = function () {
+    api('/api/c1/save', c1FormData()).then(function (res) {
+      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
+      closeModal('c1m'); toast('Подключение сохранено'); loadC1();
+    });
+  };
+  $('c1mDelete').onclick = function () {
+    if (this.dataset.confirm !== C1.editing) { this.dataset.confirm = C1.editing; this.textContent = 'Точно удалить?'; return; }
+    api('/api/c1/delete', { id: C1.editing }).then(function (res) {
+      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
+      closeModal('c1m'); toast('Подключение удалено'); loadC1();
+    });
+  };
+  $('c1mCheck').onclick = function () {
+    warnIn('c1mWarn', '', 'Проверяю подключение…');
+    api('/api/c1/check', c1FormData()).then(function (res) {
+      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
+      warnIn('c1mWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || ''));
+    });
+  };
+  function c1Test(id) {
+    warnIn('c1ListWarn', '', 'Проверяю соединение с «' + esc((c1Conn(id) || {}).name || '') + '»…');
+    api('/api/c1/test', { id: id }).then(function (res) {
+      if (!res.ok) { warnIn('c1ListWarn', 'err', esc(res.message)); loadC1(); return; }
+      warnIn('c1ListWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || '')); loadC1();
+    });
+  }
+  function c1Call(id) {
+    var x = c1Conn(id); if (!x) return;
+    warnIn('c1ListWarn', '', 'Вызываю ' + esc(x.module || '') + '.' + esc(x.method || '') + ' в «' + esc(x.name) + '»…');
+    api('/api/c1/call', { id: id }).then(function (res) {
+      if (!res.ok) { warnIn('c1ListWarn', 'err', esc(res.message)); return; }
+      var txt = typeof res.result === 'string' ? res.result : JSON.stringify(res.result, null, 2);
+      warnIn('c1ListWarn', '', '✓ ответ 1С: ' + esc(String(txt == null ? '(пусто)' : txt).slice(0, 500)));
+    });
+  }
   // дополнительный член комиссии — только для этого протокола
   $('pm_extra_add').onclick = function () {
     $('pm_extra').insertAdjacentHTML('beforeend', '<div class="xrow"><select><option>Член комиссии</option><option>Заместитель председателя комиссии</option><option>Председатель комиссии</option><option>Секретарь комиссии</option></select>' +
