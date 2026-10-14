@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Пример: протокол подведения итогов (223-ФЗ). Формат — статья «XML: протокол» в базе знаний. -->
+<protocol>
+  <noticeNumber>32616399999</noticeNumber>
+  <protocolDate>2026-10-27</protocolDate>
+  <applications>
+    <application>
+      <participantName>ООО "ГАММА"</participantName>
+      <inn>0000000003</inn>
+      <price>1712000.00</price>
+      <rejected>false</rejected>
+    </application>
+    <application>
+      <participantName>ООО "ДЕЛЬТА"</participantName>
+      <inn>0000000004</inn>
+      <price>1698500.00</price>
+      <rejected>false</rejected>
+    </application>
+    <application>
+      <participantName>ООО "ОМЕГА"</participantName>
+      <inn>0000000012</inn>
+      <price>1720000.00</price>
+      <rejected>true</rejected>
+      <rejectReason>Заявка не соответствует требованиям п. 3.2 документации (не представлены документы)</rejectReason>
+    </application>
+  </applications>
+  <winnerName>ООО "ДЕЛЬТА"</winnerName>
+  <winnerInn>0000000004</winnerInn>
+</protocol>

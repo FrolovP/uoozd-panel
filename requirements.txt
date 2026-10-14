@@ -1,0 +1,10 @@
+# Панель УООЗД
+openpyxl>=3.1.5
+python-docx>=1.1.0
+pypdf>=4.0.0
+docxtpl[subdoc]==0.20.2
+xlrd>=2.0.2
+
+# Хранилище MySQL (modules/)
+PyMySQL>=1.1.0
+cryptography>=42.0.0

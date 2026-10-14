@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv*/
+venv/
+
+# Данные и реестры (не публикуются)
+Демо-реестр/
+Реестр*.xlsx
+*.doc
+*.docx
+*.pdf
+!samples/*
+ошибка запуска.txt
+*.log
+
+# MySQL (локальное развёртывание)
+mysql/server/
+mysql/data/
+mysql/grants.sql
+
+# Секреты
+config.ini
+.env
+*.pem
+
+# OS
+Thumbs.db
+.DS_Store

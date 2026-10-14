@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>База знаний — форматы файлов</title>
+<style>
+:root{
+  --bg:#f4f4f1; --surface:#fcfcfb; --surface-2:#f0efec; --line:#e3e2dd; --line-strong:#cfcdc6;
+  --text:#0b0b0b; --text-2:#52514e; --text-3:#7b7a75; --accent:#2a78d6; --accent-soft:#e6f0fc;
+  --radius:14px; --shadow:0 1px 2px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#171715; --surface:#1f1f1d; --surface-2:#262624; --line:#333330; --line-strong:#44443f;
+    --text:#e8e7e3; --text-2:#b9b8b2; --text-3:#8b8a84; --accent:#5b9be6; --accent-soft:#22364d; --shadow:none; }
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg); color:var(--text); font:14px/1.55 "Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif}
+.layout{max-width:1280px; margin:0 auto; padding:20px 24px 48px; display:grid; grid-template-columns:260px 1fr; gap:20px}
+@media (max-width:900px){ .layout{grid-template-columns:1fr} }
+header.page{grid-column:1/-1; display:flex; align-items:center; gap:14px; flex-wrap:wrap}
+h1{font-size:20px; margin:0}
+.back{margin-left:auto; display:inline-flex; align-items:center; gap:6px; height:34px; padding:0 12px; border-radius:10px;
+  border:1px solid var(--line); background:var(--surface); color:var(--text); text-decoration:none}
+.back:hover{border-color:var(--line-strong); background:var(--surface-2)}
+nav.kb{position:sticky; top:12px; align-self:start; display:grid; gap:2px; font-size:13px}
+nav.kb a{padding:7px 10px; border-radius:8px; color:var(--text-2); text-decoration:none}
+nav.kb a:hover{background:var(--surface-2)}
+nav.kb a.on{background:var(--accent-soft); color:var(--accent); font-weight:600}
+article{background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:18px 22px; box-shadow:var(--shadow); margin-bottom:16px}
+article h2{margin:0 0 10px; font-size:17px}
+article h3{margin:16px 0 6px; font-size:14.5px}
+article p{margin:6px 0; color:var(--text-2)}
+article code{background:var(--surface-2); border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:12.5px}
+article pre{background:var(--surface-2); border:1px solid var(--line); border-radius:10px; padding:12px 14px; overflow:auto; font-size:12.5px}
+table{border-collapse:collapse; width:100%; margin:8px 0; font-size:13px}
+th,td{border:1px solid var(--line); padding:6px 10px; text-align:left; vertical-align:top}
+th{background:var(--surface-2); font-weight:600}
+.warn{background:#fdf3dc; border:1px solid #e8d194; color:#7a5200; border-radius:10px; padding:10px 14px; font-size:13px}
+@media (prefers-color-scheme: dark){ .warn{background:#33290f; border-color:#544312; color:#e6c877} }
+.req{font-size:11px; color:var(--text-3)}
+</style>
+</head>
+<body>
+<div class="layout">
+  <header class="page">
+    <h1>База знаний — форматы файлов</h1>
+    <a class="back" href="/">← К панели</a>
+  </header>
+
+  <nav class="kb" id="kbNav">
+    <a href="#common">Общие правила</a>
+    <a href="#zayavka">1. Заявка 1С (Excel)</a>
+    <a href="#reestr">2. Реестр ОАО (Excel)</a>
+    <a href="#izv">3. Извещение (docx)</a>
+    <a href="#proto">4. Протокол (docx/doc)</a>
+    <a href="#dogovor">5. Договор (docx/pdf)</a>
+    <a href="#pp">6. Платёжка (1С txt/pdf)</a>
+    <a href="#obmen">7. Таблицы обмена (Excel)</a>
+    <a href="#xml">8. XML — извещение</a>
+    <a href="#xml-proto">8. XML — протокол</a>
+    <a href="#xml-table">8. XML — табличный</a>
+    <a href="#xml-sec">8. Ограничения XML</a>
+  </nav>
+
+  <div>
+  <article id="common">
+    <h2>Общие правила</h2>
+    <table>
+      <tr><th>Правило</th><th>Значение</th></tr>
+      <tr><td>Кодировка</td><td>UTF-8 (в XML — с объявлением <code>&lt;?xml version="1.0" encoding="UTF-8"?&gt;</code>)</td></tr>
+      <tr><td>Даты</td><td><code>ДД.ММ.ГГГГ</code>; в XML ЕИС допустим ISO <code>ГГГГ-ММ-ДД</code> — панель переводит сама</td></tr>
+      <tr><td>Суммы</td><td>рубли, копейки через точку или запятую; разделители разрядов допустимы</td></tr>
+      <tr><td>ИНН</td><td>10 цифр (юрлицо) или 12 (ИП); ведущие нули значимы</td></tr>
+      <tr><td>Дубль файла</td><td>совпадение имени и SHA-256 — повторно не вносится</td></tr>
+      <tr><td>Неразобранный файл</td><td>попадает в «Входящие и журнал» с пометкой, ничего не теряется</td></tr>
+    </table>
+  </article>
+
+  <article id="zayavka">
+    <h2>1. Заявка 1С (Excel <code>.xlsx</code>/<code>.xls</code>)</h2>
+    <p>ОАО «Подготовка извещения» → «+ Новая закупка»; ОПАиЗ «Эл. заявки».</p>
+    <table>
+      <tr><th>Блок</th><th>Расположение</th><th>Содержимое</th></tr>
+      <tr><td>Шапка</td><td>первые строки, пары «поле — значение»</td><td>№ заявки 1С, дата, инициатор, подразделение, НМЦК, площадка, способ</td></tr>
+      <tr><td>Позиции</td><td>таблица ниже шапки</td><td>Наименование · ОКПД2 · Кол-во · Ед. · Цена · Сумма · РФ-оборудование</td></tr>
+      <tr><td>Ответственные</td><td>после позиций</td><td>контактное лицо, e-mail, телефон</td></tr>
+    </table>
+    <p>Формат «2027» (закрытый аукцион): добавляются «Приоритет (паспорт)», «Проректор»; позиции на нескольких листах — категория позиции = имя листа. E-mail ответственного сопоставляется со справочником сотрудников.</p>
+  </article>
+
+  <article id="reestr">
+    <h2>2. Реестр ОАО (Excel «Реестр &lt;год&gt;.xlsx»)</h2>
+    <p>Строка 1 — заголовок документа, строка 2 — шапка, данные — с 3-й строки. Листы: «Конкурентные», «Неконкурентные».</p>
+    <p>Колонки (точные заголовки): <code>№ ОАО</code> · <code>№ извещения</code> · <code>Предмет закупки</code> · <code>Способ</code> · <code>НМЦК</code> · <code>Ответственный</code> · <code>Площадка</code> · <code>Дата публикации</code> · <code>Дата вскрытия</code> · <code>Рассмотрение</code> · <code>Итоги</code> · <code>Договор до</code> · <code>Цена победителя</code> · <code>Экономия</code> · <code>Статус</code> · <code>Кат. см и сп</code>.</p>
+    <p><code>№ ОАО</code> уникален в пределах года и листа (<code>1535зэа</code>, <code>415р</code>). <code>Ответственный</code> — всегда «Фамилия И.О.».</p>
+  </article>
+
+  <article id="izv">
+    <h2>3. Извещение (Word <code>.docx</code>)</h2>
+    <p>Текст извещения с площадки. Распознаются: номер, способ, НМЦК («Начальная (максимальная) цена»), даты этапов («Дата и время окончания подачи заявок», «Дата вскрытия», «Рассмотрение заявок», «Подведение итогов»), площадка, контакты. Проверка на дубль — по номеру извещения.</p>
+  </article>
+
+  <article id="proto">
+    <h2>4. Протокол (Word <code>.docx</code>/<code>.doc</code>)</h2>
+    <p>Таблица участников: наименование, ИНН, цена, отклонение с причиной. Итоговый пункт («Победителем признать…») задаёт победителя; без него — наименьшая цена среди неотклонённых. Протокол с другими значениями по заполненным полям уходит «На проверке» («было → станет»).</p>
+  </article>
+
+  <article id="dogovor">
+    <h2>5. Договор (Word <code>.docx</code> / PDF)</h2>
+    <p>Номер и дата — только из файла; цена договора; срок исполнения из «с … по …»; предмет — из заголовка или п. 1.1. Договор от другой закупки — панель спрашивает подтверждение.</p>
+  </article>
+
+  <article id="pp">
+    <h2>6. Платёжка (выгрузка 1С <code>.txt</code> / PDF)</h2>
+    <p>Имя файла: <code>ПП &lt;номер&gt; от &lt;ДД.ММ.ГГГГ&gt;</code> (расширение любое) или <code>пп_152431_06022026</code>.</p>
+    <p>Из формата обмена с банком читаются: № и дата ПП, сумма, ИНН получателя, назначение платежа. Ошибки сверки — в разделе «Ошибки в ПП»: сумма ≠ реестру, чужой ИНН, нет № договора в назначении, ПП раньше документа без аванса, переплата, дубль номера.</p>
+  </article>
+
+  <article id="obmen">
+    <h2>7. Таблицы обмена между отделами (Excel)</h2>
+    <table>
+      <tr><th>Файл</th><th>Направление</th><th>Обязательные колонки</th></tr>
+      <tr><td>Таблица ОАО за неделю</td><td>ОАО → ОВРК</td><td>№ договора, дата, контрагент, цена, вид (договор/ДС)</td></tr>
+      <tr><td>Перечень платёжек</td><td>бухгалтерия → ОВРК</td><td>№ ПП, дата, сумма, ИНН получателя, назначение</td></tr>
+      <tr><td>Маршрут согласования</td><td>ОАО → ОПАиЗ</td><td>№ заявки 1С, этап, дата, держатель</td></tr>
+      <tr><td>Потребность к СЗ (по листам)</td><td>инициаторы → ОПАиЗ</td><td>лист = категория; Наименование, Кол-во, Ед.</td></tr>
+    </table>
+  </article>
+
+  <article id="xml">
+    <h2>8. XML — извещение 223-ФЗ (<code>eis223-notice</code>)</h2>
+    <p>Приём — те же точки, что docx/xlsx: перетаскивание на страницу и папки «входящие». Корень <code>&lt;notice&gt;</code>.</p>
+    <table>
+      <tr><th>XML-элемент</th><th>Поле панели</th><th class="req">Обязательность</th></tr>
+      <tr><td><code>noticeNumber</code> / <code>purchaseNumber</code></td><td>№ извещения</td><td>да</td></tr>
+      <tr><td><code>purchaseObjectInfo</code></td><td>предмет</td><td>да</td></tr>
+      <tr><td><code>maxPrice</code> / <code>initialSum</code></td><td>НМЦК</td><td>да</td></tr>
+      <tr><td><code>purchaseMethod</code></td><td>способ</td><td>нет</td></tr>
+      <tr><td><code>etpName</code></td><td>площадка</td><td>нет</td></tr>
+      <tr><td><code>publishDate</code> · <code>openingDate</code> · <code>examinationDate</code> · <code>summarizingDate</code></td><td>даты этапов</td><td>нет</td></tr>
+      <tr><td><code>contact/email</code>, <code>contact/phone</code></td><td>контакты</td><td>нет</td></tr>
+      <tr><td><code>lots/lot/okpd2</code></td><td>коды ОКПД2</td><td>нет</td></tr>
+    </table>
+    <pre>&lt;notice&gt;
+  &lt;noticeNumber&gt;32616399999&lt;/noticeNumber&gt;
+  &lt;purchaseObjectInfo&gt;Поставка расходных материалов…&lt;/purchaseObjectInfo&gt;
+  &lt;maxPrice&gt;1850000.00&lt;/maxPrice&gt;
+  &lt;openingDate&gt;2026-10-21T10:00:00&lt;/openingDate&gt;
+&lt;/notice&gt;</pre>
+  </article>
+
+  <article id="xml-proto">
+    <h2>8. XML — протокол (<code>eis223-protocol</code>)</h2>
+    <p>Корень <code>&lt;protocol&gt;</code>: <code>noticeNumber</code>, <code>protocolDate</code>, повторяющийся <code>applications/application</code> (<code>participantName</code>, <code>inn</code>, <code>price</code>, <code>rejected</code>, <code>rejectReason</code>), <code>winnerName</code>/<code>winnerInn</code>. Если победитель не указан — наименьшая цена среди неотклонённых.</p>
+  </article>
+
+  <article id="xml-table">
+    <h2>8. XML — табличный (<code>table-xml</code>)</h2>
+    <p>Универсальный формат: корень <code>&lt;rows&gt;</code>, строки <code>&lt;row&gt;</code>, ячейки <code>&lt;col name="…"&gt;значение&lt;/col&gt;</code>. Имена колонок — как в реестре (раздел 2): «Номер ОАО», «Предмет закупки», «НМЦК», «Способ», «Ответственный», «Дата вскрытия», «Победитель», «Цена победителя», «ИНН». Незнакомые имена сохраняются как есть.</p>
+  </article>
+
+  <article id="xml-sec">
+    <h2>8. Ограничения безопасности XML</h2>
+    <div class="warn">XML с <code>&lt;!DOCTYPE</code>, <code>&lt;!ENTITY</code> или XInclude отклоняется до парсинга (защита от XXE). Размер файла — до 20 МБ. SHA-256 считается всегда и участвует в защите от дублей.</div>
+  </article>
+  </div>
+</div>
+<script>
+(function(){
+  var links=[].slice.call(document.querySelectorAll('#kbNav a'));
+  var secs=links.map(function(a){return document.querySelector(a.getAttribute('href'));});
+  function mark(){
+    var y=scrollY+80, cur=0;
+    secs.forEach(function(s,i){ if(s && s.offsetTop<=y) cur=i; });
+    links.forEach(function(a,i){ a.classList.toggle('on', i===cur); });
+  }
+  addEventListener('scroll', mark, {passive:true}); mark();
+})();
+</script>
+</body>
+</html>

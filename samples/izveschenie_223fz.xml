@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Пример: извещение 223-ФЗ (упрощённая выгрузка площадки). Формат — статья «XML: извещение» в базе знаний. -->
+<notice>
+  <noticeNumber>32616399999</noticeNumber>
+  <purchaseMethod>Запрос котировок в электронной форме</purchaseMethod>
+  <etpName>РТС-тендер</etpName>
+  <purchaseObjectInfo>Поставка расходных материалов для ПЦР-лаборатории для нужд Сеченовского Университета в 2026 году</purchaseObjectInfo>
+  <maxPrice>1850000.00</maxPrice>
+  <publishDate>2026-10-12</publishDate>
+  <openingDate>2026-10-21T10:00:00</openingDate>
+  <examinationDate>2026-10-23</examinationDate>
+  <summarizingDate>2026-10-27</summarizingDate>
+  <contact>
+    <email>kuznetsova_a_s@staff.sechenov.ru</email>
+    <phone>+7 (495) 000-00-00</phone>
+  </contact>
+  <lots>
+    <lot>
+      <lotNumber>1</lotNumber>
+      <okpd2>26.60.12.119</okpd2>
+    </lot>
+  </lots>
+</notice>
