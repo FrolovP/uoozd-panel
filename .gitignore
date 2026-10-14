@@ -20,7 +20,7 @@ mysql/data/
 mysql/grants.sql
 
 # Секреты
-config.ini
+/config.ini
 .env
 *.pem
 
