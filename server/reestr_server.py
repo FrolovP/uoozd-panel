@@ -1769,6 +1769,380 @@ def odata_api(path, data, user):
     raise ValueError('Нет такой команды 1С OData')
 
 
+# =====================================================================
+# БАЗЫ 1С БЕЗ ВЕБ-ПУБЛИКАЦИИ — прямой COM-запуск 1С (технологический сервер)
+# Второй вариант подключения для баз, которые не опубликованы как OData:
+# панель (Windows-сервер с установленной 1С) открываетEnterpriseConnector
+# по строке соединения («файл», «localhost», «сервер/база» + пароль доступа)
+# и вызывает общий модуль 1С через COM-соединение. Требует pywin32
+# (pythoncom) на машине панели; на Linux/Mac раздел показывает подсказку
+# и позволяет завести/проверить параметры подключения.
+# Хранение: «Панель — подключения 1С прямые.json». Пароль доступа хранится
+# рядом с панелью — доступ к файлу должен быть только у сервера.
+# =====================================================================
+
+ФАЙЛ_1С_ПРЯМЫЕ = 'Панель — подключения 1С прямые.json'
+COM_TIMEOUT = 60                 # секунд на вызов общего модуля 1С
+_1c_lock = threading.Lock()
+
+
+def c1_load_raw():
+    rows = _json_file(ФАЙЛ_1С_ПРЯМЫЕ, [])
+    return rows if isinstance(rows, list) else []
+
+
+def c1_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_1С_ПРЯМЫЕ, json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def c1_public(rec):
+    """Для браузера: без пароля доступа, с признаком «пароль задан» и строкой соединения без секрета."""
+    out = {k: rec.get(k) for k in ('id', 'name', 'base', 'server', 'user', 'desc', 'module', 'method', 'param',
+                                   'enabled', 'created_at', 'updated_at', 'last_check')}
+    out['connect'] = c1_hide_secret(rec.get('connect'))
+    out['has_password'] = bool(rec.get('password')) or ',' in str(rec.get('connect') or '')
+    return out
+
+
+def c1_form_data(rec):
+    """Что подставить в форму при повторной проверке/вызове (без Pwd из строки)."""
+    d = c1_public(rec)
+    connect = str(rec.get('connect') or '')
+    if ',Pwd=' in connect:
+        head = connect.split(',Pwd=')[0]
+        tail = connect[len(head) + 5:]
+        if tail.startswith(('Usr=', 'License=', 'Debug')):
+            connect = f'{head},{tail}'
+        else:
+            connect = head
+    d['connect'] = connect
+    d['password'] = str(rec.get('password') or '')
+    return d
+
+
+def c1_norm_connect(s):
+    """Строка соединения 1С → нормализованный вид '<вид><данные>,Pwd=<пароль>' или '<вид><данные>'.
+
+    Секрет доступа из хвоста строки («File=…\\1CV8,секрет») переносится в Pwd= — иначе 1С
+    принимает его за имя базы."""
+    t = str(s or '').strip().rstrip(',')
+    if not t:
+        raise ValueError('Не указана строка соединения с базой 1С')
+    low = t.lower()
+    if not any(low.startswith(p) for p in ('file=', 'filew=', 'dbn=', 'postgres', 'mysql', 'oracle', 'sqlserver',
+                                           'managedserver=', 'comcntr=', 'ws=')):
+        raise ValueError('Строка должна начинаться с File=…, ManagedServer=…, Comcntr=… или DbNch=… — как в конфиге 1С')
+    if ',' in t:
+        head, tail = t.rsplit(',', 1)
+        tl = tail.strip().lower()
+        if tail.strip() and not tl.startswith(('usr=', 'pwd=', 'license=', 'debug')):
+            t = f'{head},Pwd={tail.strip()}'
+    return t
+
+
+def c1_split_password(connect):
+    """Из строки соединения «File=…\\1CV8,secret» → секрет доступа (последний сегмент после запятой)."""
+    parts = str(connect or '').rsplit(',', 1)
+    if len(parts) == 2 and parts[1].strip() and 'password=' not in parts[1].lower():
+        return parts[1].strip()
+    return ''
+
+
+def c1_is_windows():
+    return os.name == 'nt'
+
+
+def c1_com_available():
+    """Есть ли на машине панели pythoncom (pywin32) — прямой запуск 1С возможен только с ним."""
+    try:
+        import pythoncom  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def c1_open_connection(connect, timeout=COM_TIMEOUT):
+    """Открывает EnterpriseConnector (COM) к базе 1С без веб-публикации.
+
+    Возвращает объект соединения; ошибки превращает в понятный текст."""
+    try:
+        import win32com.client
+        import pythoncom
+    except ImportError as e:
+        raise ValueError('На компьютере панели не установлен pywin32 — прямой запуск 1С невозможен. '
+                         'Установите: pip install pywin32 (нужна Windows с установленной платформой 1С)') from e
+    connect = c1_norm_connect(connect)
+    try:
+        coord = win32com.client.Dispatch('V83.COMConnector', clsctx=pythoncom.CLSCTX_LOCAL_SERVER)
+        conn = coord.Connect(connect)
+    except Exception as e:
+        text = ' '.join(str(x) for x in e.args[:2]) if getattr(e, 'args', None) else str(e)
+        low = text.lower()
+        if 'не найдена' in low or 'not found' in low or '-2147' in low and 'база' in low:
+            raise ValueError(f'База 1С не найдена по строке «{c1_hide_secret(connect)}» — проверьте путь и имя базы') from e
+        if 'логин' in low or 'пользовател' in low or 'login' in low:
+            raise ValueError(f'1С отклонила пользователя «{text}»'.rstrip('» ') + ' — проверьте имя пользователя и пароль') from e
+        if 'лиценз' in low or 'license' in low:
+            raise ValueError('1С отказала: нет лицензии на подключение через COM — проверьте лицензию технологического сервера') from e
+        raise ValueError(f'1С не ответила на прямое подключение: {text[:300]}') from e
+    if conn is None:
+        raise ValueError('1С вернула пустое соединение — база открыта в монопольном режиме или недоступна')
+    return conn
+
+
+def c1_hide_secret(connect):
+    """Строка соединения без секрета — для сообщений об ошибках и журнала."""
+    parts = str(connect or '').rsplit(',', 1)
+    if len(parts) == 2 and parts[1].strip():
+        return parts[0] + ',••••'
+    return str(connect or '')
+
+
+def c1_call(conn, module, method, param):
+    """Вызов общего модуля 1С: conn.<Module>().<Method>(param) → ответ."""
+    mod = str(module or '').strip()
+    met = str(method or '').strip()
+    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*', mod):
+        raise ValueError('Имя общего модуля 1С может состоять только из букв, цифр и подчёркивания')
+    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*', met):
+        raise ValueError('Имя процедуры/функции 1С может состоять только из букв, цифр и подчёркивания')
+    try:
+        obj = getattr(conn, mod)
+    except AttributeError as e:
+        raise ValueError(f'Общий модуль «{mod}» в конфигурации 1С не найден — проверьте имя модуля') from e
+    try:
+        fn = getattr(obj(), met)
+    except Exception as e:
+        raise ValueError(f'Модуль «{mod}» вызывается, но процедуры/функции «{met}» в нём нет: {str(e)[:200]}') from e
+    try:
+        res = fn(param) if str(param or '') != '' else fn()
+    except Exception as e:
+        raise ValueError(f'1С выполнила «{mod}.{met}» с ошибкой: {str(e)[:300]}') from e
+    return res
+
+
+def c1_result_to_jsonable(v):
+    """Ответ 1С (строка/число/булево/ТаблицаЗначений/Массив) → обычный Python для JSON."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    s = str(v)
+    if s.startswith('{') or s.startswith('['):
+        try:
+            return json.loads(s)
+        except ValueError:
+            pass
+    return s
+
+
+def c1_assemble(data):
+    """Собрать строку соединения из полей формы: «файл/сервер + путь + имя базы» + секрет.
+
+    Поддерживает и готовую строку в поле connect, и раздельные поля (для пользователей)."""
+    connect = str(data.get('connect') or '').strip()
+    base = str(data.get('base') or '').strip()
+    server = str(data.get('server') or '').strip()
+    user = str(data.get('user') or '').strip()
+    password = str(data.get('password') or '')
+    if not connect and base:
+        b = base.replace('\\', '/').rstrip('/')
+        name = b.rsplit('/', 1)[-1]
+        if server:
+            connect = f'File={b},{name}'
+        else:
+            connect = f'File="{b}",{name}'
+    if connect and user and 'Usr=' not in connect:
+        connect = connect.rstrip(',') + ',Usr=' + user
+    if connect and password and 'Pwd=' not in connect:
+        connect = connect.rstrip(',') + ',Pwd=' + password
+    return connect
+
+
+def c1_conn_check(data, actor):
+    """Проверка прямого подключения по данным формы → {'ok','message','checked_at'}."""
+    checked_at = datetime.now().isoformat(timespec='seconds')
+    res = {'ok': False, 'message': '', 'checked_at': checked_at}
+    data = dict(data or {})
+    old = c1_find(str(data.get('id') or '')) if data.get('id') else None
+    # если пароль не вводили — берём сохранённый из записи (или из сохранённой строки)
+    if not str(data.get('password') or ''):
+        if old:
+            saved_pw = str(old.get('password') or '') or c1_split_password(str(old.get('connect') or ''))
+            if saved_pw and 'Pwd=' not in str(data.get('connect') or ''):
+                data['password'] = saved_pw
+    connect = c1_assemble(data)
+    try:
+        connect = c1_norm_connect(connect)
+    except ValueError as e:
+        res['message'] = str(e)
+        return res
+    if not c1_is_windows():
+        res['message'] = ('Строка соединения корректна. Сама проверка прямым запуском выполняется только на Windows-'
+                          'сервере с установленной платформой 1С — на этом компьютере панель работает без COM 1С, '
+                          'используйте подключения OData')
+        return res
+    if not c1_com_available():
+        res['message'] = 'На компьютере панели не установлен pywin32 (pip install pywin32) — прямой запуск 1С недоступен'
+        return res
+    try:
+        conn = c1_open_connection(connect)
+    except ValueError as e:
+        res['message'] = str(e)
+        return res
+    try:
+        note = 'Соединение с базой установлено'
+        mod, met = str(data.get('module') or '').strip(), str(data.get('method') or '').strip()
+        if mod or met:
+            if not (mod and met):
+                res['message'] = note + ' ✓. Для проверки обмена заполните и модуль, и процедуру 1С — или оставьте оба пустыми'
+                res['ok'] = True
+                return res
+            raw = c1_call(conn, mod, met, data.get('param'))
+            val = c1_result_to_jsonable(raw)
+            preview = json.dumps(val, ensure_ascii=False)[:500] if not isinstance(val, str) else val[:500]
+            note += f', ответ 1С «{mod}.{met}»: {preview or "(пусто)"}'
+        res['ok'] = True
+        res['message'] = note
+    except ValueError as e:
+        res['message'] = f'Соединение с базой установлено ✓, но {e}'
+    finally:
+        try:
+            conn.Disconnect()
+        except Exception:
+            pass
+    return res
+
+
+def c1_find(conn_id):
+    for x in c1_load_raw():
+        if x.get('id') == conn_id:
+            return x
+    return None
+
+
+def c1_save_last_check(conn_id, check):
+    with _1c_lock:
+        rows = c1_load_raw()
+        hit = False
+        for x in rows:
+            if x.get('id') == conn_id:
+                x['last_check'] = check
+                hit = True
+        if hit:
+            c1_save_raw(rows)
+
+
+def c1_save_conn(data, actor):
+    """Создание/изменение прямого подключения администратором."""
+    with _1c_lock:
+        rows = c1_load_raw()
+        cid = str(data.get('id') or '').strip()
+        if not cid:
+            cid = re.sub(r'[^a-z0-9_-]', '', str(data.get('name') or 'c1').lower())[:40] or 'c1'
+            base_id, n = cid, 2
+            while any(x.get('id') == cid for x in rows):
+                cid = f'{base_id}-{n}'
+                n += 1
+        old = next((x for x in rows if x.get('id') == cid), None)
+        name = str(data.get('name') or '').strip()
+        if not name:
+            raise ValueError('Название подключения обязательно')
+        data = dict(data)
+        if not str(data.get('password') or '') and old:
+            saved_pw = str(old.get('password') or '') or c1_split_password(str(old.get('connect') or ''))
+            if saved_pw:
+                data['password'] = saved_pw
+        connect = c1_norm_connect(c1_assemble(data))
+        rec = {
+            'id': cid,
+            'name': name[:120],
+            'connect': connect,
+            'base': str(data.get('base') or '').strip()[:120],
+            'server': str(data.get('server') or '').strip()[:120],
+            'user': str(data.get('user') or '').strip()[:120],
+            'password': str(data.get('password') or ''),
+            'desc': str(data.get('desc') or '').strip()[:300],
+            'module': str(data.get('module') or '').strip()[:120],
+            'method': str(data.get('method') or '').strip()[:120],
+            'param': str(data.get('param') or '')[:2000],
+            'enabled': bool(data.get('enabled', True)),
+            'created_at': (old or {}).get('created_at') or datetime.now().isoformat(timespec='seconds'),
+            'updated_at': datetime.now().isoformat(timespec='seconds'),
+            'last_check': (old or {}).get('last_check'),
+        }
+        if old:
+            rows = [rec if x.get('id') == cid else x for x in rows]
+        else:
+            rows.append(rec)
+        c1_save_raw(rows)
+        log('edit', f"1С прямое: подключение «{rec['name']}» ({c1_hide_secret(connect)}) сохранено",
+            user=(actor or {}).get('fio') or 'панель')
+        return c1_public(rec)
+
+
+def c1_delete_conn(conn_id, actor):
+    with _1c_lock:
+        rows = c1_load_raw()
+        rec = next((x for x in rows if x.get('id') == conn_id), None)
+        if not rec:
+            raise ValueError('Подключение не найдено')
+        c1_save_raw([x for x in rows if x.get('id') != conn_id])
+        log('edit', f"1С прямое: подключение «{rec['name']}» удалено", user=(actor or {}).get('fio') or 'панель')
+
+
+def c1_api(path, data, user):
+    """Эндпоинты раздела: POST /api/c1/…  (все — только для администратора)."""
+    if not user.get('admin'):
+        raise PermissionError('Раздел «Подключение к 1С» доступен только администратору')
+    if path == '/api/c1/list':
+        return {'ok': True, 'items': [c1_public(x) for x in c1_load_raw()],
+                'windows': c1_is_windows(), 'com': c1_com_available()}
+    if path == '/api/c1/save':
+        return {'ok': True, 'item': c1_save_conn(data, user)}
+    if path == '/api/c1/delete':
+        c1_delete_conn(str(data.get('id') or ''), user)
+        return {'ok': True}
+    if path == '/api/c1/check':
+        check = c1_conn_check(data, user)
+        if data.get('id'):
+            c1_save_last_check(str(data.get('id')), check)
+            log('info' if check['ok'] else 'error',
+                f"1С прямое: проверка «{(c1_find(str(data['id'])) or {}).get('name') or data.get('id')}» — {check['message']}",
+                user=user.get('fio') or 'панель')
+        return {'ok': True, **check}
+    if path == '/api/c1/test':
+        rec = c1_find(str(data.get('id') or ''))
+        if not rec:
+            raise ValueError('Подключение не найдено')
+        check = c1_conn_check(c1_form_data(rec), user)
+        c1_save_last_check(rec['id'], check)
+        log('info' if check['ok'] else 'error', f"1С прямое: проверка «{rec['name']}» — {check['message']}",
+            user=user.get('fio') or 'панель')
+        if not check['ok']:
+            raise ValueError(check['message'])
+        return {'ok': True, **check}
+    if path == '/api/c1/call':
+        rec = c1_find(str(data.get('id') or ''))
+        if not rec:
+            raise ValueError('Подключение не найдено')
+        if not rec.get('enabled'):
+            raise ValueError('Подключение отключено администратором')
+        if not c1_is_windows() or not c1_com_available():
+            raise ValueError('Прямое подключение к 1С работает только на Windows-сервере панели с pywin32 и установленной платформой 1С')
+        conn = c1_open_connection(c1_norm_connect(c1_assemble(c1_form_data(rec))))
+        try:
+            res = c1_call(conn, data.get('module') or rec.get('module'),
+                          data.get('method') or rec.get('method'), data.get('param', rec.get('param')))
+        finally:
+            try:
+                conn.Disconnect()
+            except Exception:
+                pass
+        log('info', f"1С прямое: «{rec['name']}» вызван {data.get('module') or rec.get('module')}.{data.get('method') or rec.get('method')}",
+            user=user.get('fio') or 'панель')
+        return {'ok': True, 'result': c1_result_to_jsonable(res)}
+    raise ValueError('Нет такой команды прямого подключения 1С')
+
+
 def odata_xlsx_bytes(res):
     """Выгрузка результата OData-запроса в .xlsx (openpyxl)."""
     wb = Workbook()
@@ -8681,6 +9055,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {'ok': True, **dirs_payload()})
             elif path.startswith('/api/odata/'):
                 self.send_json(200, odata_api(path, data, user))
+            elif path.startswith('/api/c1/'):
+                self.send_json(200, c1_api(path, data, user))
             elif path == '/api/dirs/save':
                 if not user.get('admin'):
                     self.send_json(403, {'ok': False, 'message': 'Справочники меняет администратор'})
@@ -10676,6 +11052,12 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <div class="toolbar"><button class="btn primary" id="odRun">Запросить</button><button class="btn" id="odXlsx">Выгрузить в Excel</button><span class="muted" id="odInfo"></span><span class="grow"></span><button class="btn sm" id="odPrev">← предыдущая страница</button><button class="btn sm" id="odNext">следующая страница →</button></div>
     <div class="warnbox" id="odWarn" style="margin:0 0 8px"></div>
     <div class="tablewrap"><table class="at" id="odResult"></table></div>
+  </section>
+  <section class="card" style="margin-top:16px">
+    <h2>Подключение к 1С без веб-публикации <span class="muted">прямое COM-соединение с базой (File=…, ManagedServer=…)</span></h2>
+    <div class="toolbar"><span class="muted" id="c1ModeHint">Для баз, которые не опубликованы как OData: панель обращается к базе напрямую через COM-соединение 1С. Работает на Windows-сервере панели с установленной платформой 1С.</span><span class="grow"></span><button class="btn primary" id="c1Add">+ Подключение</button></div>
+    <div class="tablewrap"><table class="at" id="c1Table"></table></div>
+    <div class="warnbox" id="c1ListWarn" style="margin:8px 0 0"></div>
   </section>
 </div>
 </div>
