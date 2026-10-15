@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
@@ -186,6 +187,16 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 ODATA_TIMEOUT = 20          # секунд на HTTP-запрос к 1С
 ODATA_PAGE = 50             # страница $top по умолчанию
 ODATA_MAX_ROWS = 5000       # максимум строк за один просмотр таблицы
+
+# Синхронизация сопоставленных данных из баз 1С (Администрирование → Настройка источников):
+ФАЙЛ_МАППИНГИ = 'Панель — сопоставления 1С.json'    # настройки сопоставления реквизитов
+ФАЙЛ_СИНХРО = 'Панель — синхронизация 1С.json'      # журнал прогонов (последние 300)
+ФАЙЛ_СИНХРО_НАСТР = 'Панель — синхронизация 1С — расписание.json'  # расписание авто-синхронизации
+ФАЙЛ_ИСТОЧНИКИ = 'Панель — источники 1С.json'       # единый список источников (OData / COM / MCP)
+ФАЙЛ_КЛЮЧИ_1С = 'Реестр — ключи 1С.json'            # GUID строки реестра → номер закупки
+СИНХРО_МАКС_СТРОК = 2000                            # максимум строк за прогон по одному сопоставлению
+СИНХРО_ПАУЗА = 3                                    # секунд между запросами к 1С внутри прогона
+SOURCES_LOCK = threading.Lock()                     # одна синхронизация с 1С одновременно
 
 # Планировщик: через сколько дней после итогов договор считать «затянувшимся».
 ДОГОВОР_ЖДЁМ_ДНЕЙ = 20
@@ -2219,6 +2230,844 @@ def odata_xlsx_bytes(res):
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# =====================================================================
+# ЕДИНЫЕ ИСТОЧНИКИ 1С (Администрирование → Настройка источников)
+# Список из N источников с индивидуальными параметрами; транспорты:
+#   odata — публикация OData (параметры как у старых подключений),
+#   com   — прямое COM-соединение (File="…"; / Srvr="…";Ref="…"),
+#   mcp   — Python-прокси MCP-сервера 1С (JSON-RPC tools/call на http://…/mcp).
+# Хранение: «Панель — источники 1С.json». Запись:
+#   {"id","name","transport","params":{…},"enabled","created_at","updated_at","last_check"}
+# Старые файлы подключений при первом запуске мигрируются сюда автоматически.
+# Единый слой доступа: src_fields(rec) → [{'name','label'}],
+#                     src_rows(rec, filt, orderby, top, skip, watermark) → {'columns','rows','total'}.
+# =====================================================================
+
+SRC_TRANSPORTS = ('odata', 'com', 'mcp')
+
+
+def src_load_raw():
+    rows = _json_file(ФАЙЛ_ИСТОЧНИКИ, [])
+    return rows if isinstance(rows, list) else []
+
+
+def src_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ИСТОЧНИКИ, json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def src_migrate_once():
+    """Перенос старых подключений OData/COM в единый список источников (однократно)."""
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        if rows or (ПАПКА_ПАНЕЛИ / ФАЙЛ_ИСТОЧНИКИ).exists():
+            return
+        moved = []
+        for x in odata_load_raw():
+            p = {k: x.get(k) for k in ('base', 'entity', 'login', 'password', 'filter', 'orderby', 'top', 'ignore_cert')}
+            moved.append({'id': f"od-{x.get('id')}", 'name': x.get('name'), 'transport': 'odata',
+                          'params': p, 'enabled': bool(x.get('enabled', True)),
+                          'created_at': x.get('created_at'), 'updated_at': x.get('updated_at'),
+                          'last_check': x.get('last_check')})
+        for x in c1_load_raw():
+            p = {k: x.get(k) for k in ('connect', 'base', 'server', 'user', 'password', 'desc', 'module', 'method', 'param')}
+            moved.append({'id': f"c1-{x.get('id')}", 'name': x.get('name'), 'transport': 'com',
+                          'params': p, 'enabled': bool(x.get('enabled', True)),
+                          'created_at': x.get('created_at'), 'updated_at': x.get('updated_at'),
+                          'last_check': x.get('last_check')})
+        if not moved:
+            return
+        src_save_raw(moved)
+        # старые файлы больше не используются — оставляем резервные копии
+        for f in (ФАЙЛ_ОДATA, ФАЙЛ_1С_ПРЯМЫЕ):
+            try:
+                old = ПАПКА_ПАНЕЛИ / f
+                if old.exists():
+                    old.rename(old.with_name(old.name + '.bak'))
+            except OSError:
+                pass
+        log('info', f'Источники 1С: перенесено старых подключений — {len(moved)}')
+
+
+def src_find(src_id):
+    for x in src_load_raw():
+        if x.get('id') == src_id:
+            return x
+    return None
+
+
+def src_public(rec):
+    p = dict(rec.get('params') or {})
+    has_pw = bool(p.get('password'))
+    for k in ('password',):
+        p.pop(k, None)
+    if rec.get('transport') == 'com':
+        p['connect'] = c1_hide_secret(p.get('connect'))
+    return {'id': rec.get('id'), 'name': rec.get('name'), 'transport': rec.get('transport'),
+            'params': p, 'has_password': has_pw, 'enabled': bool(rec.get('enabled', True)),
+            'created_at': rec.get('created_at'), 'updated_at': rec.get('updated_at'),
+            'last_check': rec.get('last_check')}
+
+
+def src_norm(rec):
+    """Проверка и нормализация записи источника по транспорту."""
+    t = str(rec.get('transport') or '').strip().lower()
+    if t not in SRC_TRANSPORTS:
+        raise ValueError('Неизвестный транспорт источника — выберите OData, прямое COM или MCP')
+    p = dict(rec.get('params') or {})
+    if t == 'odata':
+        p['base'] = odata_norm_url(p.get('base'))
+        p['entity'] = str(p.get('entity') or '').strip()[:120]
+        p['login'] = str(p.get('login') or '').strip()[:120]
+        p['filter'] = str(p.get('filter') or '').strip()[:1000]
+        p['orderby'] = str(p.get('orderby') or '').strip()[:200]
+        p['top'] = max(1, min(int(p.get('top') or ODATA_PAGE), 1000))
+        p['ignore_cert'] = bool(p.get('ignore_cert'))
+    elif t == 'com':
+        p['connect'] = c1_norm_connect(c1_assemble(p))
+        p['connect'] = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', p['connect'], flags=re.IGNORECASE)
+        p['module'] = str(p.get('module') or '').strip()[:120]
+        p['method'] = str(p.get('method') or '').strip()[:120]
+        p['param'] = str(p.get('param') or '')[:2000]
+        p['desc'] = str(p.get('desc') or '').strip()[:300]
+    else:  # mcp — python-прокси MCP-сервера 1С
+        u = str(p.get('proxy_url') or '').strip()
+        if not u:
+            raise ValueError('Для транспорта MCP укажите адрес прокси (http://хост:порт/mcp)')
+        parts = urlsplit(u)
+        if parts.scheme not in ('http', 'https') or not parts.netloc:
+            raise ValueError('Адрес MCP-прокси должен начинаться с http:// или https://')
+        p['proxy_url'] = u
+        p['auth'] = str(p.get('auth') or 'none').strip().lower()
+        if p['auth'] not in ('none', 'bearer'):
+            raise ValueError('Доступный способ авторизации MCP — токен (Bearer) или без авторизации')
+        p['tool_list'] = str(p.get('tool_list') or 'list_metadata_objects').strip()[:120]
+        p['tool_meta'] = str(p.get('tool_meta') or 'get_metadata_structure').strip()[:120]
+        p['tool_data'] = str(p.get('tool_data') or '').strip()[:120]
+    rec['transport'] = t
+    rec['params'] = p
+    return rec
+
+
+def src_save(data, actor):
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        sid = str(data.get('id') or '').strip()
+        if not sid:
+            sid = str(uuid.uuid4())[:8]
+        old = next((x for x in rows if x.get('id') == sid), None)
+        name = str(data.get('name') or '').strip()
+        if not name:
+            raise ValueError('Название источника обязательно')
+        params = dict(data.get('params') or {})
+        if not str(params.get('password') or '') and old:
+            params['password'] = str((old.get('params') or {}).get('password') or '')
+        rec = src_norm({'id': sid, 'name': name[:120], 'transport': data.get('transport'), 'params': params,
+                        'enabled': bool(data.get('enabled', True)),
+                        'created_at': (old or {}).get('created_at') or datetime.now().isoformat(timespec='seconds'),
+                        'updated_at': datetime.now().isoformat(timespec='seconds'),
+                        'last_check': (old or {}).get('last_check')})
+        rows = [rec if x.get('id') == sid else x for x in rows]
+        if not any(x.get('id') == sid for x in rows):
+            rows.append(rec)
+        src_save_raw(rows)
+        log('edit', f"Источники 1С: «{name}» ({rec['transport']}) сохранён", user=(actor or {}).get('fio') or 'панель')
+        return src_public(rec)
+
+
+def src_delete(sid, actor):
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        hit = next((x for x in rows if x.get('id') == sid), None)
+        if not hit:
+            return
+        used = [m.get('name') for m in map_load() if m.get('source') == sid]
+        if used:
+            raise ValueError(f"Источник используется сопоставлениями: {', '.join(used[:5])} — сначала измените их")
+        src_save_raw([x for x in rows if x.get('id') != sid])
+        log('edit', f"Источники 1С: удалён «{hit.get('name')}»", user=(actor or {}).get('fio') or 'панель')
+
+
+def src_save_last_check(sid, check):
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        for x in rows:
+            if x.get('id') == sid:
+                x['last_check'] = check
+        src_save_raw(rows)
+
+
+# --- MCP-транспорт: JSON-RPC вызовы к python-прокси (tools/list, tools/call) ---
+
+def mcp_rpc(rec, method, params=None, timeout=None):
+    """Один JSON-RPC 2.0 запрос к MCP-прокси. → result или ValueError с текстом ошибки."""
+    p = rec.get('params') or {}
+    url = str(p.get('proxy_url') or '').strip()
+    if not url:
+        raise ValueError('У источника MCP не задан адрес прокси')
+    payload = {'jsonrpc': '2.0', 'id': int(time.time() * 1000) % 10**9, 'method': method}
+    if params is not None:
+        payload['params'] = params
+    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'),
+                                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    if str(p.get('auth') or '') == 'bearer' and p.get('password'):
+        req.add_header('Authorization', 'Bearer ' + str(p['password']))
+    ctx = None
+    if url.lower().startswith('https://') and p.get('ignore_cert'):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or 60, context=ctx) as resp:
+            j = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+    except urllib.error.HTTPError as e:
+        snippet = ''
+        try:
+            snippet = e.read(300).decode('utf-8', 'replace')
+        except Exception:
+            pass
+        raise ValueError(f'MCP-прокси ответил {e.code} {e.reason}. {snippet[:200]}') from e
+    except urllib.error.URLError as e:
+        raise ValueError(f'MCP-прокси недоступен: {getattr(e, "reason", e)}') from e
+    except socket.timeout as e:
+        raise ValueError(f'MCP-прокси не ответил за {timeout or 60} сек') from e
+    if isinstance(j, dict) and j.get('error'):
+        err = j['error']
+        raise ValueError(f"MCP: {err.get('message') or err}")
+    return (j or {}).get('result')
+
+
+def mcp_tool_call(rec, tool, args=None, timeout=None):
+    """tools/call → текст ответа инструмента MCP (из content[].text)."""
+    if not str(tool or '').strip():
+        raise ValueError('У источника MCP не задан имя инструмента')
+    res = mcp_rpc(rec, 'tools/call', {'name': tool, 'arguments': args or {}}, timeout=timeout) or {}
+    if res.get('isError'):
+        txt = '; '.join(c.get('text', '') for c in res.get('content') or [] if c.get('type') == 'text')
+        raise ValueError(f'Инструмент MCP «{tool}» вернул ошибку: {txt[:300]}')
+    out = []
+    for c in res.get('content') or []:
+        if c.get('type') == 'text':
+            out.append(c.get('text') or '')
+    text = '\n'.join(out).strip()
+    if text.startswith('{') or text.startswith('['):
+        try:
+            return json.loads(text)
+        except ValueError:
+            pass
+    return text
+
+
+# --- адаптеры источника: fields / rows / check ---
+
+def _src_odata_rec(rec):
+    p = rec.get('params') or {}
+    return {'id': rec['id'], 'name': rec.get('name'), 'base': p.get('base'), 'entity': p.get('entity'),
+            'login': p.get('login'), 'password': p.get('password'), 'filter': p.get('filter'),
+            'orderby': p.get('orderby'), 'top': p.get('top') or ODATA_PAGE,
+            'enabled': rec.get('enabled', True), 'ignore_cert': p.get('ignore_cert')}
+
+
+def _src_com_conn(rec):
+    """Открыть COM-соединение по источнику; вызывающий обязан закрыть (CoUninitialize)."""
+    p = rec.get('params') or {}
+    form = {'connect': p.get('connect'), 'server': p.get('server'), 'base': p.get('base'),
+            'user': p.get('user'), 'password': p.get('password')}
+    connect = c1_norm_connect(c1_assemble(form))
+    if p.get('password') and not re.search(r'\bpwd\s*=', connect, re.I):
+        connect = connect.rstrip(';') + f';Pwd="{p["password"]}";'
+    return c1_open_connection(connect)
+
+
+def _src_com_table(rec, module, method, param):
+    """COM: вызвать модуль.метод(param) и привести ответ к {'columns','rows','total'}."""
+    conn = _src_com_conn(rec)
+    try:
+        res = c1_result_to_jsonable(c1_call(conn, module, method, param))
+    finally:
+        conn = None
+        try:
+            import pythoncom
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+    return _as_table(res)
+
+
+def _as_table(res):
+    """Разнообразный ответ 1С/MCP → таблица {'columns','rows','total'}."""
+    if isinstance(res, dict) and 'columns' in res:
+        return {'columns': res.get('columns') or [], 'rows': res.get('rows') or [],
+                'total': res.get('total') or len(res.get('rows') or [])}
+    if isinstance(res, list):
+        cols, seen = [], set()
+        for it in res:
+            if isinstance(it, dict):
+                for k in it:
+                    if k not in seen:
+                        seen.add(k)
+                        cols.append(k)
+        rows = [[_odata_cell(it.get(c) if isinstance(it, dict) else '') for c in cols] for it in res]
+        return {'columns': cols, 'rows': rows, 'total': len(rows)}
+    raise ValueError('Ответ источника не похож на таблицу (ожидались строки с полями)')
+
+
+def src_fields(rec):
+    """Поля источника для мастера сопоставления → [{'name','label'}]."""
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    if t == 'odata':
+        probe = {'base': p.get('base'), 'login': p.get('login'), 'password': p.get('password'),
+                 'ignore_cert': p.get('ignore_cert')}
+        sets = odata_service_info(probe)
+        ent = str(p.get('entity') or '').strip()
+        props = []
+        for s in sets:
+            if s.get('name') == ent:
+                props = s.get('props') or []
+                break
+        if props:
+            return [{'name': x.get('name'), 'label': x.get('title') or x.get('name')} for x in props]
+        q = odata_query(_src_odata_rec(rec), top=1)      # хотя бы одна строка → колонки
+        return [{'name': c, 'label': c} for c in q['columns']]
+    if t == 'com':
+        if not c1_is_windows() or not c1_com_available():
+            raise ValueError('Прямое COM-подключение доступно только на Windows-сервере панели с pywin32 и платформой 1С')
+        q = _src_com_table(rec, p.get('module'), p.get('method'), p.get('param'))
+        return [{'name': c, 'label': c} for c in q['columns']]
+    # mcp: структура метаданных выбранного документа
+    obj = str(p.get('metadata_object') or '').strip()
+    if not obj:
+        raise ValueError('Для источника MCP укажите объект метаданных 1С (например, ДокументСсылка.Заказ)')
+    res = mcp_tool_call(rec, p.get('tool_meta'), {'ObjectName': obj})
+    if isinstance(res, dict):
+        fields = res.get('Fields') or res.get('fields') or res.get('Properties') or res.get('properties') or []
+        out = []
+        for f in fields:
+            if isinstance(f, dict):
+                nm = f.get('Name') or f.get('name') or ''
+                out.append({'name': nm, 'label': f.get('Description') or f.get('Synonym') or f.get('description') or nm})
+            elif isinstance(f, str):
+                out.append({'name': f, 'label': f})
+        if out:
+            return out
+    q = _as_table(res) if isinstance(res, (list, dict)) else None
+    if q:
+        return [{'name': c, 'label': c} for c in q['columns']]
+    raise ValueError('MCP не вернул список реквизитов — проверьте имя инструмента и объекта метаданных')
+
+
+def src_rows(rec, filt=None, orderby=None, top=None, skip=0, watermark=None):
+    """Строки источника → {'columns','rows','total'}. watermark: (поле, значение) — инкрементальная выборка."""
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    if t == 'odata':
+        f = str(filt if filt is not None else (p.get('filter') or '')).strip()
+        if watermark and watermark[1]:
+            wv = str(watermark[1]).replace("'", "''")
+            cond = f"{watermark[0]} gt datetime'{wv}'" if re.match(r'^\d{4}-', wv) else f"{watermark[0]} gt '{wv}'"
+            f = f'({f}) and ({cond})' if f else cond
+        return odata_query(_src_odata_rec(rec), entity=p.get('entity'), filt=f or None,
+                           orderby=str(orderby if orderby is not None else (p.get('orderby') or '')) or None,
+                           top=top, skip=skip)
+    if t == 'com':
+        if not c1_is_windows() or not c1_com_available():
+            raise ValueError('Прямое COM-подключение доступно только на Windows-сервере панели с pywin32')
+        param = str(p.get('param') or '')
+        if watermark and watermark[1]:
+            param = json.dumps({'filter_field': watermark[0], 'filter_value': str(watermark[1]),
+                                'param': param}, ensure_ascii=False)
+        return _src_com_table(rec, p.get('module'), p.get('method'), param)
+    # mcp
+    args = {}
+    wf = str(p.get('watermark_field') or '').strip()
+    if watermark and watermark[1] and wf:
+        args[wf] = str(watermark[1])
+    if str(p.get('args_template') or '').strip():
+        try:
+            base_args = json.loads(p['args_template'])
+            if isinstance(base_args, dict):
+                args = {**base_args, **args}
+            else:
+                raise ValueError('Шаблон аргументов MCP должен быть JSON-объектом {"Поле": "значение"}')
+        except ValueError as e:
+            if 'Шаблон' in str(e):
+                raise
+            raise ValueError(f'Некорректный шаблон аргументов MCP: {str(e)[:120]}') from e
+    res = mcp_tool_call(rec, p.get('tool_data'), args)
+    return _as_table(res)
+
+
+def src_check(rec, actor):
+    checked_at = datetime.now().isoformat(timespec='seconds')
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    try:
+        if t == 'odata':
+            r = conn_check(p.get('base'), p.get('login'), p.get('password'), bool(p.get('ignore_cert')), p.get('entity'))
+            r['checked_at'] = checked_at
+            return r
+        if t == 'com':
+            form = {'connect': p.get('connect'), 'server': p.get('server'), 'base': p.get('base'),
+                    'user': p.get('user'), 'password': p.get('password')}
+            r = c1_conn_check(form, actor)
+            r['checked_at'] = checked_at
+            return r
+        info = mcp_rpc(rec, 'tools/list', {}, timeout=20) or {}
+        names = [x.get('name') for x in info.get('tools') or []]
+        need = [n for n in (p.get('tool_meta'), p.get('tool_data')) if n and n not in names]
+        msg = f'Прокси отвечает, инструментов MCP: {len(names)}'
+        if need:
+            return {'ok': False, 'message': msg + f'. Нет инструментов: {", ".join(need)}', 'checked_at': checked_at}
+        return {'ok': True, 'message': msg, 'tools': names[:100], 'checked_at': checked_at}
+    except ValueError as e:
+        return {'ok': False, 'message': str(e)[:400], 'checked_at': checked_at}
+
+
+def src_api(path, data, user):
+    """POST /api/src/… — раздел «Настройка источников» (только администратор)."""
+    if not user.get('admin'):
+        raise PermissionError('«Настройка источников» доступна только администратору')
+    if path == '/api/src/list':
+        return {'ok': True, 'items': [src_public(x) for x in src_load_raw()],
+                'windows': c1_is_windows(), 'com': c1_com_available()}
+    if path == '/api/src/save':
+        return {'ok': True, 'item': src_save(data, user)}
+    if path == '/api/src/delete':
+        src_delete(str(data.get('id') or ''), user)
+        return {'ok': True}
+    rec = src_find(str(data.get('id') or ''))
+    if not rec:
+        raise ValueError('Источник не найден')
+    if not rec.get('enabled', True):
+        raise ValueError('Источник отключён администратором')
+    if path == '/api/src/check':
+        check = src_check(rec, user)
+        src_save_last_check(rec['id'], check)
+        log('info' if check['ok'] else 'error', f"Источники 1С: проверка «{rec['name']}» — {check['message']}",
+            user=user.get('fio') or 'панель')
+        return {'ok': True, **check}
+    if path == '/api/src/fields':
+        return {'ok': True, 'fields': src_fields(rec)}
+    if path == '/api/src/rows':
+        q = src_rows(rec, data.get('filter'), data.get('orderby'),
+                     min(int(data.get('top') or ODATA_PAGE), ODATA_MAX_ROWS), int(data.get('skip') or 0))
+        return {'ok': True, **q}
+    if path == '/api/src/mcp_tools':
+        info = mcp_rpc(rec, 'tools/list', {}, timeout=20) or {}
+        return {'ok': True, 'tools': [{'name': x.get('name'), 'description': (x.get('description') or '')[:200]}
+                                      for x in info.get('tools') or []]}
+    raise ValueError('Нет такой команды источника 1С')
+
+
+# =====================================================================
+# СОПОСТАВЛЕНИЕ РЕКВИЗИТОВ 1С ↔ ПАНЕЛЬ И СИНХРОНИЗАЦИЯ В РЕЕСТРЫ
+# Маппинг: источник (по id) + ключевое поле GUID + поля 1С → колонки реестра.
+# Строки реестра находятся по номеру закупки (колонка «Номер и Дата публикации»);
+# соответствие GUID↔номер запоминается в «Реестр — ключи 1С.json» после первого
+# ручного указания. При изменении документа в 1С строка перезаписывается.
+# Инкрементальная выборка — по watermark-полю источника (последняя дата прогона).
+# =====================================================================
+
+def map_load():
+    rows = _json_file(ФАЙЛ_МАППИНГИ, [])
+    return rows if isinstance(rows, list) else []
+
+
+def map_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_МАППИНГИ, json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def map_find(mid):
+    for x in map_load():
+        if x.get('id') == mid:
+            return x
+    return None
+
+
+def registry_columns(year=None):
+    """Колонки реестра Панели (для правой части мастера сопоставления)."""
+    Y = year_obj(year)
+    if not Y.registry.exists():
+        return []
+    try:
+        wb = load_workbook(Y.registry, read_only=True)
+    except PermissionError:
+        return []
+    try:
+        for ws in wb.worksheets:            # первый лист с шапкой реестра (без создания листов!)
+            data = list(ws.iter_rows(min_row=1, max_row=12, values_only=True))
+            top = None
+            for i, r in enumerate(data):
+                line = ' '.join(str(v or '').lower() for v in r)
+                if 'наименование' in line and 'номер и дата публикации' in norm(line):
+                    top = i
+                    break
+            if top is None:
+                continue
+            out = []
+            for h in data[top]:
+                h = ' '.join(str(h or '').split())
+                if h:
+                    out.append({'header': h, 'key': 'col:' + str(len(out) + 1), 'label': h})
+            return out
+        return []
+    finally:
+        wb.close()
+
+
+def mapping_suggest(src_fields_list, reg_cols_list):
+    """Автоподбор пар «поле 1С ↔ колонка реестра» по совпадению нормализованных имён."""
+    reg_by_key = {nkey(c['header']): c for c in reg_cols_list}
+    pairs = []
+    for f in src_fields_list:
+        fk = nkey(f.get('label') or f.get('name'))
+        hit = reg_by_key.get(fk)
+        if hit is None and fk:
+            for rk, c in reg_by_key.items():
+                if rk and (rk.startswith(fk) or fk.startswith(rk)) and min(len(rk), len(fk)) >= 5:
+                    hit = c
+                    break
+        if hit:
+            pairs.append({'src': f['name'], 'dst': hit['header']})
+    return pairs
+
+
+def keys_1c_load():
+    return _json_file(ФАЙЛ_КЛЮЧИ_1С, {}) or {}
+
+
+def keys_1c_put(guid, number):
+    if not guid or not number:
+        return
+    with STORE_LOCK:
+        d = keys_1c_load()
+        if d.get(guid) != number:
+            d[guid] = number
+            write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_КЛЮЧИ_1С, json.dumps(d, ensure_ascii=False, indent=1))
+
+
+def sync_log_append(entry):
+    rows = _json_file(ФАЙЛ_СИНХРО, [])
+    rows = (rows if isinstance(rows, list) else []) + [entry]
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СИНХРО, json.dumps(rows[-300:], ensure_ascii=False, indent=1))
+
+
+def sync_settings_load():
+    d = _json_file(ФАЙЛ_СИНХРО_НАСТР, None)
+    return d if isinstance(d, dict) else {'enabled': False, 'interval_min': 60, 'weekdays': [1, 2, 3, 4, 5],
+                                          'hours_from': 8, 'hours_to': 20, 'last_run': ''}
+
+
+def sync_settings_save(data, actor):
+    cur = sync_settings_load()
+    out = dict(cur)
+    out['enabled'] = bool(data.get('enabled', cur.get('enabled')))
+    out['interval_min'] = max(5, min(int(data.get('interval_min') or cur.get('interval_min') or 60), 24 * 60))
+    wd = data.get('weekdays')
+    if isinstance(wd, list):
+        out['weekdays'] = sorted({int(x) % 7 for x in wd if str(x).strip() != ''})
+    out['hours_from'] = max(0, min(int(data.get('hours_from') if data.get('hours_from') is not None else cur.get('hours_from', 8)), 23))
+    out['hours_to'] = max(1, min(int(data.get('hours_to') if data.get('hours_to') is not None else cur.get('hours_to', 20)), 24))
+    if out['hours_to'] <= out['hours_from']:
+        raise ValueError('Окончание времени должно быть позже начала')
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СИНХРО_НАСТР, json.dumps(out, ensure_ascii=False, indent=1))
+    log('edit', f"Синхронизация 1С: расписание {'вкл' if out['enabled'] else 'выкл'}, каждые {out['interval_min']} мин",
+        user=(actor or {}).get('fio') or 'панель')
+    return out
+
+
+def sync_due(now=None):
+    """Наступил ли слот авто-синхронизации (интервал + дни недели + окно часов)."""
+    s = sync_settings_load()
+    if not s.get('enabled'):
+        return False
+    now = now or datetime.now()
+    if now.weekday() not in set(s.get('weekdays') or []):
+        return False
+    if not (int(s.get('hours_from') or 0) <= now.hour < int(s.get('hours_to') or 24)):
+        return False
+    last = None
+    try:
+        last = datetime.fromisoformat(str(s.get('last_run') or ''))
+    except ValueError:
+        last = None
+    if last is None:
+        return True
+    return (now - last).total_seconds() >= int(s.get('interval_min') or 60) * 60
+
+
+def _sync_mark_run():
+    s = sync_settings_load()
+    s['last_run'] = datetime.now().isoformat(timespec='seconds')
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СИНХРО_НАСТР, json.dumps(s, ensure_ascii=False, indent=1))
+
+
+def sync_run(mapping, actor=None, dry=False):
+    """Один прогон сопоставления: читаем источник (с watermark), находим строку реестра, перезаписываем.
+
+    mapping: {'source','guid_field','map':{'поле 1С':'заголовок колонки'},'number_field'(опц.),
+              'watermark_field'(опц.)}. dry — только предпросмотр изменений без записи."""
+    mid = mapping.get('id') or ''
+    started_at = datetime.now().isoformat(timespec='seconds')
+    entry = {'at': started_at, 'mapping': mapping.get('name') or mid, 'dry': dry,
+             'read': 0, 'matched': 0, 'changed': 0, 'skipped': 0, 'errors': []}
+    rec = src_find(mapping.get('source') or '')
+    if not rec:
+        entry['errors'].append('Источник не найден (удалён?)')
+        entry['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        sync_log_append(entry)
+        return entry
+    if not rec.get('enabled', True):
+        entry['errors'].append('Источник отключён')
+        sync_log_append(entry)
+        return entry
+    wm_field = str(mapping.get('watermark_field') or '').strip()
+    wm_val = str(mapping.get('last_watermark') or '').strip() if wm_field else None
+    try:
+        q = src_rows(rec, watermark=(wm_field, wm_val) if wm_field else None,
+                     top=min(int(mapping.get('page_top') or ODATA_PAGE), ODATA_MAX_ROWS))
+    except ValueError as e:
+        entry['errors'].append(str(e)[:300])
+        sync_log_append(entry)
+        return entry
+    cols = q.get('columns') or []
+    col_of = {c: i for i, c in enumerate(cols)}
+    guid_col = mapping.get('guid_field') if mapping.get('guid_field') in col_of else (
+        'RefKey' if 'RefKey' in col_of else ('ID' if 'ID' in col_of else None))
+    num_col = mapping.get('number_field') if mapping.get('number_field') in col_of else None
+    fmap = {k: v for k, v in (mapping.get('map') or {}).items() if k in col_of and v}
+    keys = keys_1c_load()
+    new_wm = wm_val
+    if wm_field and wm_field in col_of:
+        vals = [str(r[col_of[wm_field]] or '') for r in q.get('rows') or [] if r[col_of[wm_field]]]
+        if vals:
+            new_wm = max(vals)
+    for row in (q.get('rows') or [])[:СИНХРО_МАКС_СТРОК]:
+        entry['read'] += 1
+        raw_guid = str(row[col_of[guid_col]] or '') if guid_col else ''
+        m = re.search(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', raw_guid)
+        guid = m.group(0).upper() if m else raw_guid.strip()
+        number = ''
+        if guid:
+            number = str(keys.get(guid) or '')
+        if not number and num_col:
+            number = re.sub(r'\s+', ' ', str(row[col_of[num_col]] or '')).strip()
+            if number and guid:
+                keys_1c_put(guid, number)
+        if not number:
+            entry['skipped'] += 1
+            continue
+        updates = {}
+        for src_f, dst_h in fmap.items():
+            v = row[col_of[src_f]]
+            if v in (None, ''):
+                continue
+            updates[dst_h] = v
+        if not updates:
+            entry['skipped'] += 1
+            continue
+        try:
+            changed = _sync_apply(number, updates, entry, dry)
+            if changed is None:
+                entry['skipped'] += 1
+            else:
+                entry['matched'] += 1
+                entry['changed'] += changed
+        except RegistryBusy as e:
+            entry['errors'].append(f'{number}: {str(e)[:120]}')
+        except Exception as e:
+            entry['errors'].append(f'{number}: {type(e).__name__}: {str(e)[:160]}')
+        time.sleep(0.01)
+    if new_wm and new_wm != wm_val and mid:
+        with SOURCES_LOCK:
+            rows = map_load()
+            for x in rows:
+                if x.get('id') == mid:
+                    x['last_watermark'] = new_wm
+            map_save_raw(rows)
+    entry['finished_at'] = datetime.now().isoformat(timespec='seconds')
+    sync_log_append(entry)
+    log('info' if not entry['errors'] else 'warn',
+        f"Синхронизация 1С «{entry['mapping']}»{' (предпросмотр)' if dry else ''}: прочитано {entry['read']}, "
+        f"совпало {entry['matched']}, изменено {entry['changed']}, пропущено {entry['skipped']}"
+        + (f", ошибок {len(entry['errors'])}" if entry['errors'] else ''),
+        user=(actor or {}).get('fio') or 'планировщик')
+    return entry
+
+
+def _sync_apply(number, updates, entry, dry):
+    """Перезапись ячеек строки реестра значениями из 1С. → число изменений или None (строка не найдена)."""
+    path = registry_of(number)
+    if not path:
+        return None
+    with REG_LOCK:
+        try:
+            wb = load_workbook(path) if not dry else load_workbook(path, read_only=True)
+        except PermissionError:
+            raise RegistryBusy('Реестр открыт в Excel')
+        try:
+            loc = locate(wb, number)
+            if not loc:
+                return None
+            heads_inv = {}
+            for c, h in (loc.get('heads') or {}).items():
+                heads_inv[nkey(h)] = c
+            changes = []
+            for header, value in updates.items():
+                col = heads_inv.get(nkey(header))
+                if not col:
+                    entry['errors'].append(f'{number}: колонка «{header[:40]}» не найдена в реестре')
+                    continue
+                cell = loc['ws'].cell(loc['row'], col)
+                old = cell.value
+                if isinstance(old, str) and old.startswith('='):
+                    continue          # формулы не трогаем
+                new = coerce(' '.join(str(header).split()), value)
+                if same_value(old, new):
+                    continue
+                if not dry:
+                    cell.value = safe(new) if new not in ('',) else None
+                changes.append({'col': col, 'header': header, 'old': cell_plain(old), 'new': cell_plain(new)})
+            if dry or not changes:
+                return len(changes) if changes else 0
+            save_workbook(wb, path)
+            return len(changes)
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+
+def sync_auto_all(actor=None):
+    """Прогон всех сопоставлений с режимом auto (вызывает планировщик)."""
+    done = []
+    for m in map_load():
+        if m.get('mode') == 'auto' and m.get('enabled', True):
+            if not SOURCES_LOCK.acquire(blocking=False):
+                break
+            try:
+                done.append(sync_run(m, actor=actor or {'fio': 'планировщик'})['mapping'])
+            finally:
+                SOURCES_LOCK.release()
+    return done
+
+
+def watch_sync():
+    """Поток-планировщик авто-синхронизации: раз в минуту проверяет наступление слота."""
+    while True:
+        try:
+            if sync_due():
+                _sync_mark_run()
+                sync_auto_all()
+        except Exception as e:
+            log('error', f'Сбой планировщика синхронизации: {type(e).__name__}: {e}')
+        time.sleep(60)
+
+
+def sync_api(path, data, user):
+    """POST /api/sync/… — мастер сопоставления, прогоны, расписание, журнал, экспорт/импорт."""
+    if not user.get('admin'):
+        raise PermissionError('Сопоставление и синхронизация доступны только администратору')
+    if path == '/api/sync/maps':
+        return {'ok': True, 'items': map_load(), 'sources': [src_public(x) for x in src_load_raw()],
+                'settings': sync_settings_load(), 'log': (_json_file(ФАЙЛ_СИНХРО, []) or [])[-50:][::-1]}
+    if path == '/api/sync/columns':
+        Y = year_obj(data.get('year') or None)
+        return {'ok': True, 'columns': registry_columns(data.get('year')), 'year': Y.y}
+    if path == '/api/sync/fields':
+        rec = src_find(str(data.get('source') or ''))
+        if not rec:
+            raise ValueError('Источник не найден')
+        fl = src_fields(rec)
+        return {'ok': True, 'fields': fl}
+    if path == '/api/sync/suggest':
+        rec = src_find(str(data.get('source') or ''))
+        if not rec:
+            raise ValueError('Источник не найден')
+        return {'ok': True, 'pairs': mapping_suggest(src_fields(rec), registry_columns(data.get('year')))}
+    if path == '/api/sync/bind':
+        keys_1c_put(str(data.get('guid') or ''), str(data.get('number') or ''))
+        return {'ok': True}
+    if path == '/api/sync/save':
+        m = dict(data.get('mapping') or {})
+        if not str(m.get('name') or '').strip():
+            raise ValueError('Название сопоставления обязательно')
+        if not src_find(str(m.get('source') or '')):
+            raise ValueError('Выберите источник данных')
+        if not isinstance(m.get('map'), dict) or not m['map']:
+            raise ValueError('Не задано ни одного сопоставления полей')
+        m['id'] = str(m.get('id') or '')[:8] if m.get('id') else str(uuid.uuid4())[:8]
+        m['mode'] = 'auto' if m.get('mode') == 'auto' else 'manual'
+        m['enabled'] = bool(m.get('enabled', True))
+        m['updated_at'] = datetime.now().isoformat(timespec='seconds')
+        with SOURCES_LOCK:
+            rows = map_load()
+            rows = [m if x.get('id') == m['id'] else x for x in rows]
+            if not any(x.get('id') == m['id'] for x in rows):
+                rows.append(m)
+            map_save_raw(rows)
+        log('edit', f"Сопоставление 1С: «{m['name']}» сохранено", user=user.get('fio') or 'панель')
+        return {'ok': True, 'item': m}
+    if path == '/api/sync/delete':
+        with SOURCES_LOCK:
+            rows = [x for x in map_load() if x.get('id') != str(data.get('id') or '')]
+            map_save_raw(rows)
+        log('edit', f"Сопоставление 1С: удалено {data.get('id')}", user=user.get('fio') or 'панель')
+        return {'ok': True}
+    if path == '/api/sync/run':
+        m = map_find(str(data.get('id') or ''))
+        if not m:
+            raise ValueError('Сопоставление не найдено')
+        dry = bool(data.get('dry'))
+        if not SOURCES_LOCK.acquire(blocking=False):
+            raise ValueError('Синхронизация уже выполняется — подождите окончания текущего прогона')
+        try:
+            entry = sync_run(m, actor=user, dry=dry)
+        finally:
+            SOURCES_LOCK.release()
+        return {'ok': True, 'entry': entry}
+    if path == '/api/sync/settings':
+        return {'ok': True, 'settings': sync_settings_save(data, user)}
+    if path == '/api/sync/export':
+        ids = {x.get('id') for x in map_load()}
+        rows = [x for x in map_load() if not data.get('ids') or x.get('id') in set(data['ids'])]
+        blob = json.dumps({'kind': 'uoozd-mappings-v1', 'exported_at': datetime.now().isoformat(timespec='seconds'),
+                           'items': rows}, ensure_ascii=False, indent=1)
+        return {'ok': True, 'file_b64': base64.b64encode(blob.encode('utf-8')).decode('ascii'),
+                'name': 'Сопоставления 1С.json', 'count': len(rows)}
+    if path == '/api/sync/import':
+        try:
+            blob = base64.b64decode(str(data.get('file_b64') or '')).decode('utf-8')
+            doc = json.loads(blob)
+        except Exception as e:
+            raise ValueError(f'Файл не читается как JSON маппингов: {str(e)[:120]}') from e
+        items = doc.get('items') if isinstance(doc, dict) else None
+        if not isinstance(items, list):
+            raise ValueError('В файле нет списка «items» — это не экспорт сопоставлений панели')
+        src_ids = {x.get('id') for x in src_load_raw()}
+        added, skipped = 0, 0
+        with SOURCES_LOCK:
+            rows = map_load()
+            by_id = {x.get('id'): i for i, x in enumerate(rows)}
+            for m in items:
+                if not isinstance(m, dict) or not m.get('name') or not isinstance(m.get('map'), dict):
+                    skipped += 1
+                    continue
+                if m.get('source') not in src_ids:
+                    skipped += 1
+                    continue
+                m['id'] = str(uuid.uuid4())[:8]     # всегда новый id — не затираем существующие
+                m['last_watermark'] = ''
+                m['imported_at'] = datetime.now().isoformat(timespec='seconds')
+                rows.append(m)
+                added += 1
+            map_save_raw(rows)
+        log('edit', f'Сопоставления 1С: импорт — добавлено {added}, пропущено {skipped}', user=user.get('fio') or 'панель')
+        return {'ok': True, 'added': added, 'skipped': skipped}
+    raise ValueError('Нет такой команды синхронизации')
 
 
 def load_responsibles():
@@ -9120,6 +9969,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, odata_api(path, data, user))
             elif path.startswith('/api/c1/'):
                 self.send_json(200, c1_api(path, data, user))
+            elif path.startswith('/api/src/'):
+                self.send_json(200, src_api(path, data, user))
+            elif path.startswith('/api/sync/'):
+                self.send_json(200, sync_api(path, data, user))
             elif path == '/api/dirs/save':
                 if not user.get('admin'):
                     self.send_json(403, {'ok': False, 'message': 'Справочники меняет администратор'})
@@ -9452,7 +10305,12 @@ def main():
     print('Работает. Остановить — Ctrl+C (в PyCharm — красный квадрат).\n')
 
     log('info', f'Панель запущена на {HOST}:{ПОРТ}')
+    try:
+        src_migrate_once()          # старые подключения OData/COM → единые «Источники 1С»
+    except Exception as e:
+        log('error', f'Миграция источников 1С не выполнена: {type(e).__name__}: {e}')
     threading.Thread(target=watch_folder, daemon=True).start()
+    threading.Thread(target=watch_sync, daemon=True).start()   # планировщик авто-синхронизации 1С
     if ОТКРЫТЬ_ПАНЕЛЬ:
         threading.Timer(1.0, lambda: webbrowser.open(f'http://localhost:{ПОРТ}')).start()
     try:
@@ -11081,12 +11939,19 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
 </div>
 
 <div class="view" id="viewUsers">
-  <section class="card">
+  <div class="seg" id="admTabs" role="group" aria-label="Разделы администрирования" style="width:auto;margin-bottom:14px">
+    <button type="button" data-adm="users" aria-pressed="true">Пользователи</button>
+    <button type="button" data-adm="dirs" aria-pressed="false">Справочники</button>
+    <button type="button" data-adm="src" aria-pressed="false">Настройка источников</button>
+    <button type="button" data-adm="sync" aria-pressed="false">Сопоставление и синхронизация</button>
+    <button type="button" data-adm="sched" aria-pressed="false">Расписание</button>
+  </div>
+  <section class="card adm-pane" data-pane="users">
     <h2>Пользователи <span class="muted" id="usersMode"></span></h2>
     <div class="toolbar"><span class="muted">Каждый видит вкладку своего отдела и реестры ОАО; администраторы — всё. Удалять записи из реестра может только сотрудник с правом «удаление».</span><span class="grow"></span><button class="btn primary" id="userAdd">+ Пользователь</button></div>
     <div class="tablewrap"><table class="at" id="usersTable"></table></div>
   </section>
-  <section class="card" style="margin-top:16px">
+  <section class="card adm-pane" data-pane="dirs" hidden>
     <h2>Справочники <span class="muted">видны всем, меняет администратор; ФИО приводятся к виду «Фамилия И.О.»</span></h2>
     <div class="body dirs">
       <div><h3>Комиссия по закупкам</h3><div id="dirComm"></div><button class="btn sm" data-dadd="comm">+ добавить</button></div>
@@ -11098,29 +11963,32 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <div><button class="btn primary" id="dirSave">Сохранить справочники</button></div>
     </div>
   </section>
-  <section class="card" style="margin-top:16px">
-    <h2>Подключение к 1С <span class="muted">подключения видят и настраивают только администраторы</span></h2>
-    <div class="toolbar"><span class="muted">Публикации 1С по протоколу OData (адрес вида http://сервер/база/odata или …/hs/odata). Подключения хранятся в папке панели; пароль в браузер не отдаётся.</span><span class="grow"></span><button class="btn primary" id="odAdd">+ Подключение</button></div>
-    <div class="tablewrap"><table class="at" id="odTable"></table></div>
-    <div class="warnbox" id="odListWarn" style="margin:8px 0 0"></div>
+  <section class="card adm-pane" data-pane="src" hidden>
+    <h2>Источники данных 1С <span class="muted">список из N источников: OData, прямое COM или MCP-прокси; видят и настраивают только администраторы</span></h2>
+    <div class="toolbar"><span class="muted" id="srcModeHint">Каждый источник — отдельный способ подключения со своими параметрами. Хранятся в папке панели; пароли в браузер не отдаются.</span><span class="grow"></span><button class="btn primary" id="srcAdd">+ Источник</button></div>
+    <div class="tablewrap"><table class="at" id="srcTable"></table></div>
+    <div class="warnbox" id="srcListWarn" style="margin:8px 0 0"></div>
   </section>
-  <section class="card" style="margin-top:16px" id="odQueryCard" hidden>
-    <h2>Запрос к выбранному подключению <span class="muted" id="odConnName"></span></h2>
-    <div class="fgrid" style="gap:8px 12px;margin-bottom:8px">
-      <div class="f"><label>Таблица 1С (набор данных)</label><select id="odEntity"></select></div>
-      <div class="f"><label>$filter — условие отбора (OData)</label><input id="odFilter" placeholder="например, СуммаДокумента gt 100000"></div>
-      <div class="f"><label>$orderby — сортировка</label><input id="odOrderby" placeholder="например, Дата desc"></div>
-      <div class="f"><label>Строк на страницу</label><input id="odTop" inputmode="numeric" value="50"></div>
+  <section class="card adm-pane" data-pane="sync" hidden>
+    <h2>Сопоставление реквизитов и синхронизация <span class="muted">поля источника 1С → колонки реестра Панели; ключ — GUID строки</span></h2>
+    <div class="toolbar"><span class="muted">Синхронизация обновляет найденные строки реестра значениями из 1С (пустые значения не перезаписывают, формулы не трогаются). Перед применением — предпросмотр изменений.</span><span class="grow"></span><button class="btn" id="syncExport">Экспорт в JSON</button><label class="btn" style="cursor:pointer">Импорт из JSON<input type="file" id="syncImportFile" accept=".json" hidden></label><button class="btn primary" id="mapAdd">+ Сопоставление</button></div>
+    <div class="tablewrap"><table class="at" id="mapTable"></table></div>
+    <div class="warnbox" id="syncWarn" style="margin:8px 0 0"></div>
+    <h3 style="margin-top:16px">Журнал прогонов</h3>
+    <div class="tablewrap"><table class="at" id="syncLog"></table></div>
+  </section>
+  <section class="card adm-pane" data-pane="sched" hidden>
+    <h2>Расписание авто-синхронизации <span class="muted">панель сама опрашивает источники в заданные интервалы</span></h2>
+    <div class="fgrid" style="gap:10px 14px;margin-bottom:10px">
+      <div class="f full"><label class="chk"><input type="checkbox" id="schEnabled"> Авто-синхронизация включена (выполняются сопоставления с режимом «авто»)</label></div>
+      <div class="f"><label>Интервал, минут</label><input id="schInterval" inputmode="numeric" value="60"></div>
+      <div class="f"><label>Часов с / по</label><input id="schFrom" inputmode="numeric" value="8" style="width:45%"> — <input id="schTo" inputmode="numeric" value="20" style="width:45%"></div>
+      <div class="f full"><label>Дни недели</label><div class="checks" id="schDays">
+        <label><input type="checkbox" value="1"> Пн</label><label><input type="checkbox" value="2"> Вт</label><label><input type="checkbox" value="3"> Ср</label><label><input type="checkbox" value="4"> Чт</label><label><input type="checkbox" value="5"> Пт</label><label><input type="checkbox" value="6"> Сб</label><label><input type="checkbox" value="0"> Вс</label></div></div>
+      <div class="f full"><span class="muted" id="schLast"></span></div>
     </div>
-    <div class="toolbar"><button class="btn primary" id="odRun">Запросить</button><button class="btn" id="odXlsx">Выгрузить в Excel</button><span class="muted" id="odInfo"></span><span class="grow"></span><button class="btn sm" id="odPrev">← предыдущая страница</button><button class="btn sm" id="odNext">следующая страница →</button></div>
-    <div class="warnbox" id="odWarn" style="margin:0 0 8px"></div>
-    <div class="tablewrap"><table class="at" id="odResult"></table></div>
-  </section>
-  <section class="card" style="margin-top:16px">
-    <h2>Подключение к 1С без веб-публикации <span class="muted">прямое COM-соединение с базой (File="…";Usr="…" или Srvr="…";Ref="…")</span></h2>
-    <div class="toolbar"><span class="muted" id="c1ModeHint">Для баз, которые не опубликованы как OData: панель обращается к базе напрямую через COM-соединение 1С. Работает на Windows-сервере панели с установленной платформой 1С.</span><span class="grow"></span><button class="btn primary" id="c1Add">+ Подключение</button></div>
-    <div class="tablewrap"><table class="at" id="c1Table"></table></div>
-    <div class="warnbox" id="c1ListWarn" style="margin:8px 0 0"></div>
+    <div class="toolbar"><button class="btn primary" id="schSave">Сохранить расписание</button></div>
+    <div class="warnbox" id="schWarn" style="margin:8px 0 0"></div>
   </section>
 </div>
 </div>
