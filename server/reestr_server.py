@@ -12227,45 +12227,91 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   </div>
 </div>
 
-<!-- ПОДКЛЮЧЕНИЕ 1С ODATA -->
-<div class="modal" id="odm" role="dialog" aria-modal="true" aria-labelledby="odmTitle">
-  <div class="sheet" style="width:min(640px,100%)">
-    <div class="sheet-head"><h2 id="odmTitle">Подключение к базе 1С</h2><button class="btn x" data-close="odm" aria-label="Закрыть">✕</button></div>
-    <div class="warnbox" id="odmWarn"></div>
+<!-- ИСТОЧНИК ДАННЫХ 1С (OData / COM / MCP) — новый раздел «Настройка источников» -->
+<div class="modal" id="srcm" role="dialog" aria-modal="true" aria-labelledby="srcmTitle">
+  <div class="sheet" style="width:min(700px,100%)">
+    <div class="sheet-head"><h2 id="srcmTitle">Источник данных 1С</h2><span class="muted" id="srcmSub"></span><button class="btn x" data-close="srcm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="srcmWarn"></div>
     <div style="padding:14px 22px" class="fgrid">
-      <div class="f full"><label for="odmName">Название подключения</label><input id="odmName" placeholder="например, 1С БГУ — основная" autocomplete="off"></div>
-      <div class="f full"><label for="odmBase">Адрес OData публикации 1С <span class="req">*</span></label><input id="odmBase" placeholder="http://сервер/база/odata/" autocomplete="off"><div class="hint">или расширение …/hs/odata; панель обратится к адресу и к $metadata</div></div>
-      <div class="f"><label for="odmEntity">Таблица по умолчанию (набор данных)</label><input id="odmEntity" placeholder="например, ЗаказПокупателя" autocomplete="off"></div>
-      <div class="f"><label for="odmTop">Строк на страницу</label><input id="odmTop" inputmode="numeric" value="50"></div>
-      <div class="f"><label for="odmLogin">Пользователь 1С (basic)</label><input id="odmLogin" autocomplete="off"></div>
-      <div class="f"><label for="odmPass">Пароль</label><input id="odmPass" type="password" autocomplete="new-password"><div class="hint" id="odmPassHint"></div></div>
-      <div class="f full"><label for="odmFilter">Фильтр по умолчанию ($filter)</label><input id="odmFilter" placeholder="можно оставить пустым"></div>
-      <div class="f full"><label for="odmOrderby">Сортировка по умолчанию ($orderby)</label><input id="odmOrderby" placeholder="например, Дата desc"></div>
-      <label class="chk full"><input type="checkbox" id="odmEnabled"> подключение включено (пока выключено — запросы к нему запрещены)</label>
-      <label class="chk full"><input type="checkbox" id="odmIgnoreCert"> не проверять сертификат при https (для самоподписанных)</label>
+      <div class="f full"><label for="srcmName">Название источника <span class="req">*</span></label><input id="srcmName" placeholder="например, 1С БГУ — основная" autocomplete="off"></div>
+      <div class="f full"><label>Транспорт подключения</label>
+        <div class="seg" id="srcmTransport" style="width:auto">
+          <button type="button" data-tr="odata" aria-pressed="true">OData</button>
+          <button type="button" data-tr="com" aria-pressed="false">Прямое COM</button>
+          <button type="button" data-tr="mcp" aria-pressed="false">MCP-прокси</button>
+        </div>
+        <div class="hint" id="srcmTrHint"></div></div>
+      <div class="tr-block" data-for="odata" style="display:contents">
+        <div class="f full"><label for="srcmBase">Адрес OData публикации 1С <span class="req">*</span></label><input id="srcmBase" placeholder="http://сервер/база/odata/" autocomplete="off"><div class="hint">или расширение …/hs/odata; панель обратится к адресу и к $metadata</div></div>
+        <div class="f"><label for="srcmEntity">Набор данных (таблица)</label><input id="srcmEntity" placeholder="например, ЗаказПокупателя" autocomplete="off"><div class="hint" id="srcmEntityHint"></div></div>
+        <div class="f"><label for="srcmTop">Строк на страницу</label><input id="srcmTop" inputmode="numeric" value="50"></div>
+        <div class="f"><label for="srcmLogin">Пользователь 1С (basic)</label><input id="srcmLogin" autocomplete="off"></div>
+        <div class="f"><label for="srcmPass">Пароль</label><input id="srcmPass" type="password" autocomplete="new-password"><div class="hint" id="srcmPassHint"></div></div>
+        <div class="f full"><label for="srcmFilter">Фильтр по умолчанию ($filter)</label><input id="srcmFilter" placeholder="можно оставить пустым"></div>
+        <div class="f full"><label for="srcmOrderby">Сортировка по умолчанию ($orderby)</label><input id="srcmOrderby" placeholder="например, Дата desc"></div>
+        <label class="chk full"><input type="checkbox" id="srcmIgnoreCert"> не проверять сертификат при https (для самоподписанных)</label>
+      </div>
+      <div class="tr-block" data-for="com" hidden style="display:contents">
+        <div class="f full"><label for="srcmConnect">Готовая строка соединения</label><input id="srcmConnect" placeholder='File="C:\Базы\Закупки";Usr="Иванов"' autocomplete="off"><div class="hint">файловая база: File="путь к каталогу"; · клиент-серверная: Srvr="сервер";Ref="имя базы"; — можно оставить пустым и заполнить поля ниже</div></div>
+        <div class="f"><label for="srcmServer">Сервер 1С</label><input id="srcmServer" placeholder="srv1c:1541 — пусто = файловая база" autocomplete="off"></div>
+        <div class="f"><label for="srcmCbase">Путь к базе / имя базы</label><input id="srcmCbase" placeholder="C:\Базы\Закупки или имя на сервере" autocomplete="off"></div>
+        <div class="f"><label for="srcmUser">Пользователь 1С</label><input id="srcmUser" autocomplete="off"></div>
+        <div class="f"><label for="srcmCpass">Пароль</label><input id="srcmCpass" type="password" autocomplete="new-password"><div class="hint" id="srcmCpassHint"></div></div>
+        <div class="f"><label for="srcmModule">Общий модуль 1С</label><input id="srcmModule" placeholder="например, УООЗД_Интеграция" autocomplete="off"></div>
+        <div class="f"><label for="srcmMethod">Экспортная функция/процедура</label><input id="srcmMethod" placeholder="например, ПолучитьРеестрЗакупок" autocomplete="off"></div>
+        <div class="f full"><label for="srcmParam">Параметр вызова (строка)</label><input id="srcmParam" placeholder="можно оставить пустым" autocomplete="off"></div>
+        <div class="f full"><label for="srcmDesc">Комментарий</label><input id="srcmDesc" placeholder="зачем этот источник" autocomplete="off"></div>
+      </div>
+      <div class="tr-block" data-for="mcp" hidden style="display:contents">
+        <div class="f full"><label for="srcmProxy">Адрес MCP-прокси <span class="req">*</span></label><input id="srcmProxy" placeholder="http://хост:8085/mcp" autocomplete="off"><div class="hint">python-прокси MCP-сервера 1С (src/py_server): stdio-режим не подходит — нужен HTTP-эндпоинт /mcp</div></div>
+        <div class="f"><label for="srcmAuth">Авторизация прокси</label><select id="srcmAuth"><option value="none">без авторизации</option><option value="bearer">Bearer-токен</option></select></div>
+        <div class="f"><label for="srcmToken">Токен / пароль</label><input id="srcmToken" type="password" autocomplete="new-password"><div class="hint" id="srcmTokenHint"></div></div>
+        <div class="f"><label for="srcmToolMeta">Инструмент структуры метаданных</label><input id="srcmToolMeta" value="get_metadata_structure" autocomplete="off"></div>
+        <div class="f"><label for="srcmToolData">Инструмент выборки данных</label><input id="srcmToolData" placeholder="например, get_orders" autocomplete="off"></div>
+        <div class="f full"><label for="srcmMetaObj">Объект метаданных 1С</label><input id="srcmMetaObj" placeholder="например, Документ.ЗаказПокупателя" autocomplete="off"><div class="hint">для списка реквизитов в мастере сопоставления; аргумент ObjectName инструмента структуры</div></div>
+        <div class="f full"><label for="srcmArgs">Шаблон аргументов инструмента данных (JSON)</label><input id="srcmArgs" placeholder='{"UserName": "УООЗД"}' autocomplete="off"></div>
+        <div class="f full"><label for="srcmWm">Watermark-поле источника (инкрементальная выборка)</label><input id="srcmWm" placeholder="например, ДатаИзменения — можно задать и в сопоставлении" autocomplete="off"></div>
+        <div class="f full"><span class="muted" id="srcmTools"></span></div>
+      </div>
+      <label class="chk full"><input type="checkbox" id="srcmEnabled"> источник включён (пока выключен — обращения запрещены)</label>
     </div>
-    <div class="sheet-foot"><button class="btn" id="odmDelete">Удалить подключение</button><button class="btn" id="odmCheck">Проверить подключение</button><span class="grow"></span><button class="btn primary" id="odmSave">Сохранить</button></div>
+    <div class="sheet-foot"><button class="btn" id="srcmDelete">Удалить источник</button><button class="btn" id="srcmCheck">Проверить соединение</button><span class="grow"></span><button class="btn primary" id="srcmSave">Сохранить</button></div>
   </div>
 </div>
 
-<div class="modal" id="c1m" role="dialog" aria-modal="true" aria-labelledby="c1mTitle">
-  <div class="sheet" style="width:min(680px,100%)">
-    <div class="sheet-head"><h2 id="c1mTitle">Прямое подключение к базе 1С (COM)</h2><button class="btn x" data-close="c1m" aria-label="Закрыть">✕</button></div>
-    <div class="warnbox" id="c1mWarn"></div>
+<!-- МАСТЕР СОПОСТАВЛЕНИЯ РЕКВИЗИТОВ 1С ↔ КОЛОНКИ РЕЕСТРА -->
+<div class="modal" id="mapm" role="dialog" aria-modal="true" aria-labelledby="mapmTitle">
+  <div class="sheet" style="width:min(900px,100%)">
+    <div class="sheet-head"><h2 id="mapmTitle">Сопоставление реквизитов</h2><span class="muted">поля источника → колонки реестра Панели; ключ — GUID</span><button class="btn x" data-close="mapm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="mapmWarn"></div>
     <div style="padding:14px 22px" class="fgrid">
-      <div class="f full"><label for="c1mName">Название подключения</label><input id="c1mName" placeholder="например, 1С БГУ — файловая копия" autocomplete="off"></div>
-      <div class="f full"><label for="c1mConnect">Готовая строка соединения</label><input id="c1mConnect" placeholder='File="C:\Базы\Закупки";Usr="Иванов"' autocomplete="off"><div class="hint">файловая база: File="путь к каталогу"; · клиент-серверная: Srvr="сервер";Ref="имя базы"; — можно оставить пустым и заполнить поля ниже</div></div>
-      <div class="f"><label for="c1mServer">Сервер 1С</label><input id="c1mServer" placeholder="srv1c:1541 — пусто = файловая база" autocomplete="off"></div>
-      <div class="f"><label for="c1mBase">Путь к базе / имя базы</label><input id="c1mBase" placeholder="C:\Базы\Закупки или имя на сервере" autocomplete="off"></div>
-      <div class="f"><label for="c1mUser">Пользователь 1С</label><input id="c1mUser" autocomplete="off"></div>
-      <div class="f"><label for="c1mPass">Пароль</label><input id="c1mPass" type="password" autocomplete="new-password"><div class="hint" id="c1mPassHint"></div></div>
-      <div class="f"><label for="c1mModule">Общий модуль 1С</label><input id="c1mModule" placeholder="например, УООЗД_Интеграция" autocomplete="off"></div>
-      <div class="f"><label for="c1mMethod">Экспортная функция/процедура</label><input id="c1mMethod" placeholder="например, ПроверитьСвязь" autocomplete="off"></div>
-      <div class="f full"><label for="c1mParam">Параметр вызова (строка)</label><input id="c1mParam" placeholder="можно оставить пустым" autocomplete="off"></div>
-      <div class="f full"><label for="c1mDesc">Комментарий</label><input id="c1mDesc" placeholder="зачем это подключение" autocomplete="off"></div>
-      <label class="chk full"><input type="checkbox" id="c1mEnabled"> подключение включено (пока выключено — вызовы к нему запрещены)</label>
+      <div class="f"><label for="mapmName">Название сопоставления <span class="req">*</span></label><input id="mapmName" placeholder="например, Заказы → реестр 2026" autocomplete="off"></div>
+      <div class="f"><label for="mapmSource">Источник данных</label><select id="mapmSource"></select></div>
+      <div class="f"><label for="mapmYear">Реестр года</label><select id="mapmYear"></select></div>
+      <div class="f"><label for="mapmMode">Режим</label><select id="mapmMode"><option value="manual">ручной запуск</option><option value="auto">авто по расписанию</option></select></div>
+      <div class="f"><label for="mapmGuid">GUID-поле источника</label><select id="mapmGuid"><option value="">авто (RefKey / ID)</option></select></div>
+      <div class="f"><label for="mapmNumber">Поле с номером закупки (опционально)</label><select id="mapmNumber"><option value="">— не задано —</option></select></div>
+      <div class="f"><label for="mapmWm">Watermark-поле (инкрементальная выборка)</label><select id="mapmWm"><option value="">— без watermark —</option></select></div>
+      <label class="chk"><input type="checkbox" id="mapmEnabled"> сопоставление включено</label>
+      <div class="f full"><div class="toolbar" style="margin:0"><span class="muted" id="mapmPairsInfo">сопоставлено пар: 0</span><span class="grow"></span><button class="btn sm" id="mapmSuggest">Подобрать автоматически</button></div>
+        <div class="tablewrap" style="max-height:320px;overflow:auto"><table class="at" id="mapmPairs"></table></div>
+        <div class="hint">левая колонка — поле из 1С, правая — заголовок колонки реестра Панели; пустые значения из 1С не перезаписывают ячейки, формулы не трогаются.</div></div>
+      <div class="f full"><label>Первое сопоставление GUID ↔ номер (если в 1С нет номера закупки)</label>
+        <div class="row" style="gap:8px;flex-wrap:wrap"><input id="mapmBindGuid" placeholder="GUID строки из предпросмотра источника" style="flex:1;min-width:260px"><input id="mapmBindNum" placeholder="номер закупки в реестре, напр. 412зцп" style="flex:1;min-width:200px"><button class="btn sm" id="mapmBindBtn">Запомнить</button></div>
+        <div class="hint">достаточно указать один раз для каждой строки — соответствие сохранится; дальше синхронизация найдёт строку сама.</div></div>
     </div>
-    <div class="sheet-foot"><button class="btn" id="c1mDelete">Удалить подключение</button><button class="btn" id="c1mCheck">Проверить подключение</button><span class="grow"></span><button class="btn primary" id="c1mSave">Сохранить</button></div>
+    <div class="sheet-foot"><button class="btn" id="mapmPreview">Предпросмотр строк источника</button><span class="grow"></span><button class="btn primary" id="mapmSave">Сохранить сопоставление</button></div>
+    <div class="tablewrap" id="mapmPreviewWrap" hidden style="max-height:260px;overflow:auto;margin:0 22px 14px"><table class="at" id="mapmPreviewTbl"></table></div>
+  </div>
+</div>
+
+<!-- ПРЕДПРОСМОТР ПРОГОНА СИНХРОНИЗАЦИИ (dry-run) -->
+<div class="modal" id="syncp" role="dialog" aria-modal="true" aria-labelledby="syncpTitle">
+  <div class="sheet" style="width:min(900px,100%)">
+    <div class="sheet-head"><h2 id="syncpTitle">Предпросмотр синхронизации</h2><span class="muted" id="syncpSub"></span><button class="btn x" data-close="syncp" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="syncpWarn"></div>
+    <div style="padding:14px 22px" id="syncpBody"></div>
+    <div class="sheet-foot"><span class="grow"></span><button class="btn" data-close="syncp">Закрыть</button><button class="btn primary" id="syncpApply">Применить изменения</button></div>
   </div>
 </div>
 
@@ -17400,232 +17446,432 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     });
   };
 
-  // --- Базы 1С (OData) — Администрирование, только администратор ---
-  var OD = { list: [], id: '', entities: {}, skip: 0, columns: [], rows: [], total: 0, entity: '' };
-  function odConn(id) { return OD.list.filter(function (x) { return x.id === id; })[0] || null; }
-  function loadOdata() {
+  // =====================================================================
+  // АДМИНИСТРИРОВАНИЕ: подтабы разделов (пользователи, справочники,
+  // источники 1С, сопоставления, расписание синхронизации)
+  // =====================================================================
+  var ADM_TABS = ['users', 'dirs', 'src', 'sync', 'sched'];
+  function setAdmTab(t) {
+    if (ADM_TABS.indexOf(t) < 0) t = 'users';
+    store('reestr-adm-tab', t);
+    Array.prototype.forEach.call(document.querySelectorAll('#admTabs [data-adm]'), function (b) {
+      b.setAttribute('aria-pressed', b.dataset.adm === t ? 'true' : 'false'); });
+    Array.prototype.forEach.call($('viewUsers').querySelectorAll('.adm-pane'), function (s) {
+      s.hidden = s.dataset.pane !== t; });
+    if (t === 'src') loadSources();
+    if (t === 'sync') loadSync();
+    if (t === 'sched') loadSch();
+  }
+  $('admTabs').onclick = function (e) { var b = e.target.closest('[data-adm]'); if (b) setAdmTab(b.dataset.adm); };
+
+  // =====================================================================
+  // НАСТРОЙКА ИСТОЧНИКОВ 1С (OData / прямое COM / MCP-прокси) — только админ
+  // =====================================================================
+  var SRC = { list: [], editing: '', transport: 'odata', windows: false, com: false };
+  var TR_HINT = {
+    odata: 'Публикация OData в 1С (или общий HTTP-сервис …/hs/odata). Самый простой способ для веб-панели.',
+    com: 'Прямой запуск платформы 1С через COM: нужен Windows-сервер панели с pywin32 и установленной платформой 8.3.',
+    mcp: 'Подключение через python-прокси MCP-сервера 1С: база → расширение mcp.cfe → прокси /mcp → панель.'
+  };
+  function srcById(id) { return SRC.list.filter(function (x) { return x.id === id; })[0] || null; }
+  function loadSources() {
     if (!(AUTH.user && AUTH.user.admin)) return;
-    api('/api/odata/list', {}).then(function (res) {
-      if (!res.ok) { $('odTable').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message || 'Нет доступа') + '</td></tr></tbody>'; return; }
-      OD.list = res.items || [];
-      renderOdataConns();
+    api('/api/src/list', {}).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message || 'Нет доступа')); return; }
+      SRC.list = res.items || []; SRC.windows = !!res.windows; SRC.com = !!res.com;
+      renderSrcTable();
     });
   }
-  function renderOdataConns() {
-    $('odTable').innerHTML = '<thead><tr><th>Название</th><th>Адрес OData</th><th>Таблица по умолчанию</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
-      (OD.list.length ? OD.list.map(function (x) {
-        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td><td class="l">' + esc(x.base) + '</td><td>' + esc(x.entity || '—') + '</td>' +
-          '<td>' + (x.login ? esc(x.login) : 'анонимно') + (x.has_password ? ' <span class="pill ok">пароль задан</span>' : '') + '</td>' +
-          '<td>' + (x.enabled ? '<span class="pill ok">включено</span>' : '<span class="pill warn">выключено</span>') + '</td>' +
-          '<td style="white-space:nowrap"><button class="btn sm" data-odtest="' + esc(x.id) + '">Проверить</button> ' +
-          '<button class="btn sm' + (x.enabled ? ' primary' : '') + '" data-odq="' + esc(x.id) + '">Запрос</button> ' +
-          '<button class="btn sm" data-odedit="' + esc(x.id) + '">Изменить</button></td></tr>';
-      }).join('') : '<tr><td colspan="6" class="empty">Подключений пока нет — нажмите «+ Подключение».</td></tr>') + '</tbody>';
+  function srcSummary(x) {
+    var p = x.params || {};
+    if (x.transport === 'odata') return p.base || '—';
+    if (x.transport === 'com') return (p.connect || '—') + (p.module ? ' · ' + p.module + '.' + (p.method || '') : '');
+    return (p.proxy_url || '—') + (p.tool_data ? ' · ' + p.tool_data : '');
   }
-  $('odAdd').onclick = function () { openOdataConn(null); };
-  $('odTable').onclick = function (e) {
-    var t = e.target.closest('[data-odtest]'), q = e.target.closest('[data-odq]'), ed = e.target.closest('[data-odedit]');
-    if (t) odataTest(t.dataset.odtest);
-    else if (q) odataOpenQuery(q.dataset.odq);
-    else if (ed) openOdataConn(odConn(ed.dataset.odedit));
+  function renderSrcTable() {
+    $('srcTable').innerHTML = '<thead><tr><th>Название</th><th>Транспорт</th><th class="l">Параметры</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
+      (SRC.list.length ? SRC.list.map(function (x) {
+        var lc = x.last_check || {}, p = x.params || {};
+        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td>' +
+          '<td>' + ({ odata: 'OData', com: 'COM', mcp: 'MCP' })[x.transport] + '</td>' +
+          '<td class="l">' + esc(srcSummary(x)).slice(0, 160) + '</td>' +
+          '<td>' + ((p.login || p.user) ? esc(p.login || p.user) : (x.transport === 'mcp' ? (p.auth === 'bearer' ? 'Bearer' : 'без авторизации') : 'анонимно')) +
+            (x.has_password ? ' <span class="pill ok">секрет задан</span>' : '') + '</td>' +
+          '<td>' + (x.enabled ? '<span class="pill ok">включён</span>' : '<span class="pill warn">выключен</span>') +
+            (lc.checked_at ? '<br><span class="muted">' + (lc.ok ? '✓ ' : '✕ ') + esc((lc.checked_at || '').replace('T', ' ')) + '</span>' : '') + '</td>' +
+          '<td style="white-space:nowrap"><button class="btn sm" data-srctest="' + esc(x.id) + '">Проверить</button> ' +
+          '<button class="btn sm" data-srcfields="' + esc(x.id) + '">Поля</button> ' +
+          '<button class="btn sm" data-srcrows="' + esc(x.id) + '">Строки</button> ' +
+          '<button class="btn sm" data-srcedit="' + esc(x.id) + '">Изменить</button></td></tr>';
+      }).join('') : '<tr><td colspan="6" class="empty">Источников пока нет — нажмите «+ Источник». Старые подключения OData/COM перенесены сюда автоматически.</td></tr>') + '</tbody>';
+  }
+  $('srcAdd').onclick = function () { openSourceModal(null); };
+  $('srcTable').onclick = function (e) {
+    var t = e.target.closest('[data-srctest]'), f = e.target.closest('[data-srcfields]'),
+        r = e.target.closest('[data-srcrows]'), ed = e.target.closest('[data-srcedit]');
+    if (t) srcCheck(t.dataset.srctest);
+    else if (f) srcShowFields(f.dataset.srcfields);
+    else if (r) srcShowRows(r.dataset.srcrows);
+    else if (ed) openSourceModal(srcById(ed.dataset.srcedit));
   };
-  function openOdataConn(x) {
-    OD.editing = x ? x.id : '';
-    $('odmName').value = x ? x.name : ''; $('odmBase').value = x ? x.base : ''; $('odmEntity').value = x ? (x.entity || '') : '';
-    $('odmLogin').value = x ? (x.login || '') : ''; $('odmPass').value = '';
-    $('odmPassHint').textContent = x && x.has_password ? 'пароль сохранён — оставьте пустым, чтобы не менять' : '';
-    $('odmFilter').value = x ? (x.filter || '') : ''; $('odmOrderby').value = x ? (x.orderby || '') : '';
-    $('odmTop').value = x ? (x.top || 50) : 50;
-    $('odmEnabled').checked = x ? !!x.enabled : true; $('odmIgnoreCert').checked = !!(x && x.ignore_cert);
-    $('odmDelete').style.display = x ? '' : 'none'; $('odmDelete').dataset.confirm = ''; $('odmDelete').textContent = 'Удалить подключение';
-    warnIn('odmWarn', ''); openModal('odm');
+  function srcTransportSet(t) {
+    SRC.transport = t;
+    Array.prototype.forEach.call($('srcmTransport').querySelectorAll('[data-tr]'), function (b) {
+      b.setAttribute('aria-pressed', b.dataset.tr === t ? 'true' : 'false'); });
+    Array.prototype.forEach.call(document.querySelectorAll('#srcm .tr-block'), function (blk) {
+      blk.hidden = blk.dataset.for !== t; });
+    $('srcmTrHint').textContent = TR_HINT[t] || '';
+    if (t === 'com' && !SRC.windows) $('srcmTrHint').textContent += ' · COM доступен только на Windows-сервере панели с pywin32';
+    var pwHint = SRC.editing && (srcById(SRC.editing) || {}).has_password ? 'секрет сохранён — оставьте пустым, чтобы не менять' : '';
+    $('srcmPassHint').textContent = t === 'odata' ? pwHint : '';
+    $('srcmCpassHint').textContent = t === 'com' ? pwHint : '';
+    $('srcmTokenHint').textContent = t === 'mcp' ? pwHint : '';
   }
-  $('odmSave').onclick = function () {
-    var d = { id: OD.editing, name: $('odmName').value.trim(), base: $('odmBase').value.trim(), entity: $('odmEntity').value.trim(),
-      login: $('odmLogin').value.trim(), password: $('odmPass').value, filter: $('odmFilter').value.trim(),
-      orderby: $('odmOrderby').value.trim(), top: +$('odmTop').value || 50, enabled: $('odmEnabled').checked, ignore_cert: $('odmIgnoreCert').checked };
-    api('/api/odata/save', d).then(function (res) {
-      if (!res.ok) { warnIn('odmWarn', 'err', esc(res.message)); return; }
-      closeModal('odm'); toast('Подключение сохранено'); loadOdata();
-      if (OD.id === res.item.id) odataOpenQuery(res.item.id);
+  $('srcmTransport').onclick = function (e) { var b = e.target.closest('[data-tr]'); if (b) srcTransportSet(b.dataset.tr); };
+  function openSourceModal(x) {
+    SRC.editing = x ? x.id : '';
+    var p = (x && x.params) || {};
+    $('srcmName').value = x ? x.name : '';
+    // odata
+    $('srcmBase').value = p.base || ''; $('srcmEntity').value = p.entity || ''; $('srcmTop').value = p.top || 50;
+    $('srcmLogin').value = p.login || ''; $('srcmPass').value = '';
+    $('srcmFilter').value = p.filter || ''; $('srcmOrderby').value = p.orderby || ''; $('srcmIgnoreCert').checked = !!p.ignore_cert;
+    // com
+    $('srcmConnect').value = p.connect || ''; $('srcmServer').value = p.server || ''; $('srcmCbase').value = p.base || '';
+    $('srcmUser').value = p.user || ''; $('srcmCpass').value = '';
+    $('srcmModule').value = p.module || ''; $('srcmMethod').value = p.method || ''; $('srcmParam').value = p.param || ''; $('srcmDesc').value = p.desc || '';
+    // mcp
+    $('srcmProxy').value = p.proxy_url || ''; $('srcmAuth').value = p.auth || 'none'; $('srcmToken').value = '';
+    $('srcmToolMeta').value = p.tool_meta || 'get_metadata_structure'; $('srcmToolData').value = p.tool_data || '';
+    $('srcmMetaObj').value = p.metadata_object || ''; $('srcmArgs').value = p.args_template || ''; $('srcmWm').value = p.watermark_field || '';
+    $('srcmTools').textContent = x && x.last_check && x.last_check.tools ? 'инструменты MCP: ' + x.last_check.tools.slice(0, 12).join(', ') : '';
+    $('srcmEnabled').checked = x ? !!x.enabled : true;
+    $('srcmTitle').textContent = x ? 'Источник: ' + x.name : 'Новый источник данных 1С';
+    $('srcmSub').textContent = x ? ('id ' + x.id) : '';
+    $('srcmDelete').style.display = x ? '' : 'none'; $('srcmDelete').dataset.confirm = ''; $('srcmDelete').textContent = 'Удалить источник';
+    srcTransportSet(x ? x.transport : 'odata');
+    warnIn('srcmWarn', ''); openModal('srcm');
+  }
+  function srcFormData() {
+    var t = SRC.transport, params = {};
+    if (t === 'odata') params = { base: $('srcmBase').value.trim(), entity: $('srcmEntity').value.trim(), top: +$('srcmTop').value || 50,
+      login: $('srcmLogin').value.trim(), password: $('srcmPass').value, filter: $('srcmFilter').value.trim(),
+      orderby: $('srcmOrderby').value.trim(), ignore_cert: $('srcmIgnoreCert').checked };
+    else if (t === 'com') params = { connect: $('srcmConnect').value.trim(), server: $('srcmServer').value.trim(), base: $('srcmCbase').value.trim(),
+      user: $('srcmUser').value.trim(), password: $('srcmCpass').value, module: $('srcmModule').value.trim(), method: $('srcmMethod').value.trim(),
+      param: $('srcmParam').value, desc: $('srcmDesc').value.trim() };
+    else params = { proxy_url: $('srcmProxy').value.trim(), auth: $('srcmAuth').value, password: $('srcmToken').value,
+      tool_meta: $('srcmToolMeta').value.trim(), tool_data: $('srcmToolData').value.trim(), metadata_object: $('srcmMetaObj').value.trim(),
+      args_template: $('srcmArgs').value.trim(), watermark_field: $('srcmWm').value.trim() };
+    return { id: SRC.editing, name: $('srcmName').value.trim(), transport: t, params: params, enabled: $('srcmEnabled').checked };
+  }
+  $('srcmSave').onclick = function () {
+    api('/api/src/save', srcFormData()).then(function (res) {
+      if (!res.ok) { warnIn('srcmWarn', 'err', esc(res.message)); return; }
+      closeModal('srcm'); toast('Источник сохранён'); loadSources();
     });
   };
-  $('odmDelete').onclick = function () {
-    if (this.dataset.confirm !== OD.editing) { this.dataset.confirm = OD.editing; this.textContent = 'Точно удалить?'; return; }
-    api('/api/odata/delete', { id: OD.editing }).then(function (res) {
-      if (!res.ok) { warnIn('odmWarn', 'err', esc(res.message)); return; }
-      closeModal('odm'); toast('Подключение удалено');
-      if (OD.id === OD.editing) { OD.id = ''; $('odQueryCard').hidden = true; }
-      loadOdata();
+  $('srcmDelete').onclick = function () {
+    if (this.dataset.confirm !== SRC.editing) { this.dataset.confirm = SRC.editing; this.textContent = 'Точно удалить?'; return; }
+    api('/api/src/delete', { id: SRC.editing }).then(function (res) {
+      if (!res.ok) { warnIn('srcmWarn', 'err', esc(res.message)); return; }
+      closeModal('srcm'); toast('Источник удалён'); loadSources();
     });
   };
-  function odataTest(id) {
-    warnIn('odListWarn', '', 'Проверяю соединение с «' + esc((odConn(id) || {}).name || '') + '»…');
-    api('/api/odata/test', { id: id }).then(function (res) {
-      if (!res.ok) { warnIn('odListWarn', 'err', esc(res.message)); return; }
-      warnIn('odListWarn', '', '✓ ' + esc(res.message) + ' — можно выбирать таблицы в блоке «Запрос» ниже.');
+  $('srcmCheck').onclick = function () {
+    warnIn('srcmWarn', '', 'Сохраняю и проверяю соединение…');
+    api('/api/src/save', srcFormData()).then(function (res) {
+      if (!res.ok) { warnIn('srcmWarn', 'err', esc(res.message)); return; }
+      return api('/api/src/check', { id: res.item.id }).then(function (r) {
+        if (!r.ok) { warnIn('srcmWarn', 'err', esc(r.message)); return; }
+        warnIn('srcmWarn', r.ok ? '' : 'err', (r.ok ? '✓ ' : '✕ ') + esc(r.message || ''));
+        if (r.ok && r.tools) $('srcmTools').textContent = 'инструменты MCP: ' + r.tools.slice(0, 12).join(', ');
+        loadSources();
+      });
+    });
+  };
+  function srcCheck(id) {
+    warnIn('srcListWarn', '', 'Проверяю «' + esc((srcById(id) || {}).name || '') + '»…');
+    api('/api/src/check', { id: id }).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message)); return; }
+      warnIn('srcListWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || '')); loadSources();
     });
   }
-  function odataOpenQuery(id) {
-    var x = odConn(id); if (!x) return;
-    OD.id = id; OD.skip = 0; OD.entities = {};
-    $('odQueryCard').hidden = false; $('odConnName').textContent = '— ' + x.name + ' (' + x.base + ')';
-    $('odFilter').value = x.filter || ''; $('odOrderby').value = x.orderby || ''; $('odTop').value = x.top || 50;
-    $('odResult').innerHTML = '<tbody><tr><td class="empty">читаю список таблиц из $metadata…</td></tr></tbody>';
-    $('odInfo').textContent = ''; warnIn('odWarn', '');
-    api('/api/odata/entities', { id: id }).then(function (res) {
-      if (!res.ok) { $('odResult').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message) + '</td></tr></tbody>'; return; }
-      OD.entities = {};
-      (res.entities || []).forEach(function (s) { OD.entities[s.name] = s; });
-      var names = (res.entities || []).map(function (s) { return s.name; });
-      $('odEntity').innerHTML = names.map(function (n) { return '<option' + (n === x.entity ? ' selected' : '') + '>' + esc(n) + '</option>'; }).join('') || '<option value="">(нет наборов данных)</option>';
-      if (!names.length) $('odResult').innerHTML = '<tbody><tr><td class="empty">$metadata не вернул ни одного набора данных — опубликуйте OData в 1С.</td></tr></tbody>';
-      else if (x.entity) odataRun();
+  function srcShowFields(id) {
+    warnIn('srcListWarn', '', 'Читаю поля источника…');
+    api('/api/src/fields', { id: id }).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message)); return; }
+      warnIn('srcListWarn', '', '✓ полей: ' + res.fields.length + ' — ' + esc(res.fields.slice(0, 40).map(function (f) { return f.label || f.name; }).join(', ')));
+      loadSources();
     });
   }
-  function odataParams(skip) {
-    return { id: OD.id, entity: $('odEntity').value, filter: $('odFilter').value.trim(), orderby: $('odOrderby').value.trim(),
-      top: +$('odTop').value || 50, skip: skip || 0 };
-  }
-  function odataRun() {
-    if (!OD.id) return;
-    OD.skip = Math.max(0, +$('odTop').value || 50) > 0 && this && this.btn === 'next' ? OD.skip + (+$('odTop').value || 50) : (this && this.btn === 'prev' ? Math.max(0, OD.skip - (+$('odTop').value || 50)) : 0);
-    $('odResult').innerHTML = '<tbody><tr><td class="empty">запрос к 1С…</td></tr></tbody>';
-    warnIn('odWarn', '');
-    api('/api/odata/query', odataParams(OD.skip)).then(function (res) {
-      if (!res.ok) { $('odResult').innerHTML = '<tbody></tbody>'; warnIn('odWarn', 'err', esc(res.message)); return; }
-      OD.columns = res.columns || []; OD.rows = res.rows || []; OD.total = res.total || 0; OD.entity = res.entity;
-      var shown = OD.columns.slice(0, 24);
-      $('odResult').innerHTML = '<thead><tr>' + shown.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
-        (OD.rows.length ? OD.rows.slice(0, 500).map(function (r) {
-          return '<tr>' + shown.map(function (c) { return '<td class="l">' + esc(r[OD.columns.indexOf(c)]) + '</td>'; }).join('') + '</tr>';
-        }).join('') : '<tr><td colspan="' + Math.max(1, shown.length) + '" class="empty">нет строк по этому фильтру</td></tr>') + '</tbody>';
-      $('odInfo').textContent = 'строк на странице: ' + OD.rows.length + (OD.total ? ' · всего по оценке: ' + OD.total : '') +
-        (OD.columns.length > 24 ? ' · колонок: ' + OD.columns.length + ', показаны первые 24' : '');
+  function srcShowRows(id) {
+    warnIn('srcListWarn', '', 'Читаю строки источника…');
+    api('/api/src/rows', { id: id, top: 5 }).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message)); return; }
+      var cols = (res.columns || []).slice(0, 10);
+      warnIn('srcListWarn', '', '✓ колонок: ' + (res.columns || []).length + ', строк: ' + (res.rows || []).length + (res.total ? ' (всего ~' + res.total + ')' : '') +
+        '<div class="tablewrap" style="margin-top:6px"><table class="at"><thead><tr>' + cols.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') +
+        '</tr></thead><tbody>' + (res.rows || []).slice(0, 5).map(function (r) {
+          return '<tr>' + cols.map(function (c) {
+            var ix = (res.columns || []).indexOf(c);
+            return '<td class="l">' + esc(String(r[ix] == null ? '' : r[ix])).slice(0, 60) + '</td>'; }).join('') + '</tr>';
+        }).join('') + '</tbody></table></div>');
     });
   }
-  $('odRun').onclick = function () { odataRun.call({}); };
-  $('odPrev').onclick = function () { var t = +$('odTop').value || 50; OD.skip = Math.max(0, OD.skip - t); odataParamsRender(); };
-  $('odNext').onclick = function () { var t = +$('odTop').value || 50; OD.skip = OD.skip + t; odataParamsRender(); };
-  function odataParamsRender() {
-    $('odResult').innerHTML = '<tbody><tr><td class="empty">запрос к 1С…</td></tr></tbody>';
-    api('/api/odata/query', odataParams(OD.skip)).then(function (res) {
-      if (!res.ok) { warnIn('odWarn', 'err', esc(res.message)); $('odResult').innerHTML = '<tbody></tbody>'; return; }
-      OD.columns = res.columns || []; OD.rows = res.rows || []; OD.total = res.total || 0;
-      var shown = OD.columns.slice(0, 24);
-      $('odResult').innerHTML = '<thead><tr>' + shown.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
-        (OD.rows.length ? OD.rows.slice(0, 500).map(function (r) {
-          return '<tr>' + shown.map(function (c) { return '<td class="l">' + esc(r[OD.columns.indexOf(c)]) + '</td>'; }).join('') + '</tr>';
-        }).join('') : '<tr><td colspan="' + Math.max(1, shown.length) + '" class="empty">нет строк</td></tr>') + '</tbody>' +
-        '<caption class="muted">страница: skip=' + OD.skip + ' · строка с ' + (OD.skip + 1) + '</caption>';
-      $('odInfo').textContent = 'строк на странице: ' + OD.rows.length + (OD.total ? ' · всего по оценке: ' + OD.total : '');
+
+  // =====================================================================
+  // СОПОСТАВЛЕНИЕ РЕКВИЗИТОВ 1С ↔ РЕЕСТР И СИНХРОНИЗАЦИЯ — только админ
+  // =====================================================================
+  var SYNC = { maps: [], sources: [], log: [], columns: [], fields: [], pairs: {}, editing: '', lastEntry: null };
+  function loadSync() {
+    if (!(AUTH.user && AUTH.user.admin)) return;
+    api('/api/sync/maps', {}).then(function (res) {
+      if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message || 'Нет доступа')); return; }
+      SYNC.maps = res.items || []; SYNC.sources = res.sources || []; SYNC.log = res.log || [];
+      renderMapTable(); renderSyncLog();
     });
   }
-  $('odXlsx').onclick = function () {
-    if (!OD.id) return;
-    api('/api/odata/xlsx', odataParams(0)).then(function (res) {
-      if (!res.ok) { warnIn('odWarn', 'err', esc(res.message)); return; }
+  function syncMapById(id) { return SYNC.maps.filter(function (x) { return x.id === id; })[0] || null; }
+  function renderMapTable() {
+    $('mapTable').innerHTML = '<thead><tr><th>Название</th><th>Источник</th><th>Реестр года</th><th>Пар сопоставления</th><th>Режим</th><th>Watermark</th><th></th></tr></thead><tbody>' +
+      (SYNC.maps.length ? SYNC.maps.map(function (m) {
+        var s = srcById(m.source) || {};
+        return '<tr><td class="l"><b>' + esc(m.name) + '</b>' + (m.enabled === false ? ' <span class="pill warn">выкл</span>' : '') + '</td>' +
+          '<td>' + esc(s.name || '(источник удалён)') + '</td><td>' + esc(m.year || '—') + '</td>' +
+          '<td>' + Object.keys(m.map || {}).length + '</td>' +
+          '<td>' + (m.mode === 'auto' ? '<span class="pill ok">авто</span>' : 'ручной') + '</td>' +
+          '<td class="l muted">' + esc((m.watermark_field || '—') + (m.last_watermark ? ' · до ' + String(m.last_watermark).slice(0, 19) : '')) + '</td>' +
+          '<td style="white-space:nowrap"><button class="btn sm" data-mapdry="' + esc(m.id) + '">Предпросмотр</button> ' +
+          '<button class="btn sm primary" data-mapsync="' + esc(m.id) + '">Синхронизировать</button> ' +
+          '<button class="btn sm" data-mapedit="' + esc(m.id) + '">Изменить</button> ' +
+          '<button class="btn sm" data-mapdel="' + esc(m.id) + '">✕</button></td></tr>';
+      }).join('') : '<tr><td colspan="7" class="empty">Сопоставлений пока нет — нажмите «+ Сопоставление», выберите источник и свяжите поля 1С с колонками реестра.</td></tr>') + '</tbody>';
+  }
+  function renderSyncLog() {
+    $('syncLog').innerHTML = '<thead><tr><th>Когда</th><th>Сопоставление</th><th>Режим</th><th>Прочитано</th><th>Совпало</th><th>Изменено</th><th>Пропущено</th><th>Ошибки</th></tr></thead><tbody>' +
+      (SYNC.log.length ? SYNC.log.map(function (e) {
+        return '<tr><td class="muted">' + esc((e.at || '').replace('T', ' ')) + '</td><td class="l">' + esc(e.mapping || '') + '</td>' +
+          '<td>' + (e.dry ? 'предпросмотр' : 'запись') + '</td><td>' + (e.read || 0) + '</td><td>' + (e.matched || 0) + '</td>' +
+          '<td>' + (e.changed || 0) + '</td><td>' + (e.skipped || 0) + '</td>' +
+          '<td>' + (e.errors && e.errors.length ? '<span class="pill warn">' + e.errors.length + '</span> <span class="muted">' + esc(String(e.errors[0])).slice(0, 80) + '</span>' : '—') + '</td></tr>';
+      }).join('') : '<tr><td colspan="8" class="empty">Прогонов ещё не было.</td></tr>') + '</tbody>';
+  }
+  $('mapAdd').onclick = function () { openMapModal(null); };
+  $('mapTable').onclick = function (e) {
+    var d = e.target.closest('[data-mapdry]'), s = e.target.closest('[data-mapsync]'),
+        ed = e.target.closest('[data-mapedit]'), del = e.target.closest('[data-mapdel]');
+    if (d) runSync(d.dataset.mapdry, true);
+    else if (s) runSync(s.dataset.mapsync, false);
+    else if (ed) openMapModal(syncMapById(ed.dataset.mapedit));
+    else if (del) {
+      var m = syncMapById(del.dataset.mapdel); if (!m) return;
+      if (del.dataset.confirm !== m.id) { del.dataset.confirm = m.id; del.textContent = 'Точно?'; return; }
+      api('/api/sync/delete', { id: m.id }).then(function (res) {
+        if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
+        toast('Сопоставление удалено'); loadSync();
+      });
+    }
+  };
+  function mapSelFill(sel, items, cur, blankLabel) {
+    sel.innerHTML = '<option value="">' + blankLabel + '</option>' +
+      items.map(function (x) { return '<option value="' + esc(x.name) + '"' + (x.name === cur ? ' selected' : '') + '>' + esc(x.label || x.name) + '</option>'; }).join('');
+  }
+  function openMapModal(m) {
+    SYNC.editing = m ? m.id : '';
+    $('mapmTitle').textContent = m ? 'Сопоставление: ' + m.name : 'Новое сопоставление реквизитов';
+    $('mapmName').value = m ? m.name : '';
+    $('mapmSource').innerHTML = '<option value="">— выберите источник —</option>' +
+      SYNC.sources.map(function (x) { return '<option value="' + esc(x.id) + '"' + (m && m.source === x.id ? ' selected' : '') + '>' + esc(x.name) + ' · ' + ({ odata: 'OData', com: 'COM', mcp: 'MCP' })[x.transport] + '</option>'; }).join('');
+    var ys = yearsList();
+    $('mapmYear').innerHTML = ys.map(function (y) { return '<option' + (String(y.year) === String(m && m.year) ? ' selected' : '') + '>' + y.year + '</option>'; }).join('');
+    $('mapmMode').value = m && m.mode === 'auto' ? 'auto' : 'manual';
+    $('mapmEnabled').checked = m ? m.enabled !== false : true;
+    SYNC.fields = []; SYNC.columns = []; SYNC.pairs = m ? (m.map || {}) : {};
+    $('mapmGuid').innerHTML = '<option value="">авто (RefKey / ID)</option>';
+    $('mapmNumber').innerHTML = '<option value="">— не задано —</option>';
+    $('mapmWm').innerHTML = '<option value="">— без watermark —</option>';
+    $('mapmBindGuid').value = ''; $('mapmBindNum').value = '';
+    $('mapmPreviewWrap').hidden = true;
+    renderPairsTable();
+    warnIn('mapmWarn', ''); openModal('mapm');
+    if (m && m.source) mapLoadCols();
+  }
+  $('mapmSource').onchange = function () { mapLoadCols(); };
+  $('mapmYear').onchange = function () { mapLoadCols(); };
+  function mapLoadCols() {
+    var sid = $('mapmSource').value;
+    if (!sid) { warnIn('mapmWarn', 'err', 'Выберите источник'); return; }
+    warnIn('mapmWarn', '', 'Читаю поля источника и колонки реестра…');
+    Promise.all([api('/api/sync/fields', { source: sid }), api('/api/sync/columns', { year: $('mapmYear').value })]).then(function (rs) {
+      var rf = rs[0], rc = rs[1];
+      if (!rf.ok) { warnIn('mapmWarn', 'err', esc(rf.message)); return; }
+      if (!rc.ok) { warnIn('mapmWarn', 'err', esc(rc.message)); return; }
+      SYNC.fields = rf.fields || []; SYNC.columns = rc.columns || [];
+      warnIn('mapmWarn', '', '✓ полей 1С: ' + SYNC.fields.length + ' · колонок реестра: ' + SYNC.columns.length);
+      mapSelFill($('mapmGuid'), SYNC.fields, ($('mapmGuid').options[$('mapmGuid').selectedIndex] || {}).value || '', 'авто (RefKey / ID)');
+      mapSelFill($('mapmNumber'), SYNC.fields, $('mapmNumber').value, '— не задано —');
+      mapSelFill($('mapmWm'), SYNC.fields, $('mapmWm').value, '— без watermark —');
+      renderPairsTable();
+    });
+  }
+  function renderPairsTable() {
+    var pairs = SYNC.pairs || {};
+    var names = Object.keys(pairs);
+    if (!names.length && SYNC.fields.length) names = SYNC.fields.map(function (f) { return f.name; });
+    $('mapmPairsInfo').textContent = 'сопоставлено пар: ' + Object.keys(pairs).length + (SYNC.fields.length ? ' из ' + SYNC.fields.length + ' полей' : '');
+    $('mapmPairs').innerHTML = '<thead><tr><th class="l">Поле источника 1С</th><th>→ Колонка реестра Панели</th><th></th></tr></thead><tbody>' +
+      (names.length ? names.map(function (fn) {
+        var fld = SYNC.fields.filter(function (f) { return f.name === fn; })[0];
+        return '<tr><td class="l">' + esc((fld && fld.label) || fn) + ' <span class="muted">' + esc(fn) + '</span></td>' +
+          '<td><select data-pair="' + esc(fn) + '"><option value="">— не сопоставлять —</option>' +
+          SYNC.columns.map(function (c) { return '<option' + (pairs[fn] === c.header ? ' selected' : '') + '>' + esc(c.header) + '</option>'; }).join('') +
+          '</select></td><td><button class="btn sm" data-pdrop="' + esc(fn) + '" title="Убрать поле из сопоставления">✕</button></td></tr>';
+      }).join('') : '<tr><td colspan="3" class="empty">нет полей — выберите источник</td></tr>') + '</tbody>';
+  }
+  $('mapmPairs').onchange = function (e) {
+    var s = e.target.closest('[data-pair]'); if (!s) return;
+    if (s.value) SYNC.pairs[s.dataset.pair] = s.value; else delete SYNC.pairs[s.dataset.pair];
+    $('mapmPairsInfo').textContent = 'сопоставлено пар: ' + Object.keys(SYNC.pairs).length;
+  };
+  $('mapmPairs').onclick = function (e) {
+    var b = e.target.closest('[data-pdrop]'); if (!b) return;
+    delete SYNC.pairs[b.dataset.pdrop]; renderPairsTable();
+  };
+  $('mapmSuggest').onclick = function () {
+    var sid = $('mapmSource').value;
+    if (!sid) { warnIn('mapmWarn', 'err', 'Сначала выберите источник'); return; }
+    warnIn('mapmWarn', '', 'Подбираю пары по названиям…');
+    api('/api/sync/suggest', { source: sid, year: $('mapmYear').value }).then(function (res) {
+      if (!res.ok) { warnIn('mapmWarn', 'err', esc(res.message)); return; }
+      (res.pairs || []).forEach(function (pr) { SYNC.pairs[pr.src] = pr.dst; });
+      renderPairsTable();
+      warnIn('mapmWarn', '', '✓ подобрано пар: ' + (res.pairs || []).length + ' — проверьте и при необходимости поправьте вручную');
+    });
+  };
+  $('mapmBindBtn').onclick = function () {
+    var g = $('mapmBindGuid').value.trim(), n = $('mapmBindNum').value.trim();
+    if (!g || !n) { warnIn('mapmWarn', 'err', 'Заполните GUID и номер закупки'); return; }
+    api('/api/sync/bind', { guid: g, number: n }).then(function (res) {
+      warnIn('mapmWarn', res.ok ? '' : 'err', res.ok ? '✓ соответствие GUID ↔ номер сохранено' : esc(res.message));
+    });
+  };
+  $('mapmPreview').onclick = function () {
+    var sid = $('mapmSource').value;
+    if (!sid) { warnIn('mapmWarn', 'err', 'Сначала выберите источник'); return; }
+    $('mapmPreviewWrap').hidden = false;
+    $('mapmPreviewTbl').innerHTML = '<tbody><tr><td class="empty">запрос к источнику…</td></tr></tbody>';
+    api('/api/src/rows', { id: sid, top: 10 }).then(function (res) {
+      if (!res.ok) { $('mapmPreviewTbl').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message) + '</td></tr></tbody>'; return; }
+      var cols = (res.columns || []).slice(0, 12);
+      $('mapmPreviewTbl').innerHTML = '<thead><tr>' + cols.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
+        (res.rows || []).map(function (r) {
+          return '<tr>' + cols.map(function (c) {
+            var v = String(r[(res.columns || []).indexOf(c)] == null ? '' : r[(res.columns || []).indexOf(c)]);
+            var isGuid = /^[0-9a-fA-F]{8}-/.test(v) && v.length > 30;
+            return '<td class="l"' + (isGuid ? ' data-bindguid="' + esc(v) + '" style="cursor:pointer" title="Кликните, чтобы подставить в поле GUID привязки"' : '') + '>' + esc(v).slice(0, 40) + '</td>';
+          }).join('') + '</tr>';
+        }).join('') + '</tbody>';
+    });
+  };
+  $('mapmPreviewTbl').onclick = function (e) {
+    var td = e.target.closest('[data-bindguid]');
+    if (td) { $('mapmBindGuid').value = td.dataset.bindguid; $('mapmBindNum').focus(); }
+  };
+  $('mapmSave').onclick = function () {
+    var mapping = { id: SYNC.editing, name: $('mapmName').value.trim(), source: $('mapmSource').value, year: $('mapmYear').value,
+      mode: $('mapmMode').value, enabled: $('mapmEnabled').checked, guid_field: $('mapmGuid').value,
+      number_field: $('mapmNumber').value, watermark_field: $('mapmWm').value, map: SYNC.pairs || {} };
+    api('/api/sync/save', { mapping: mapping }).then(function (res) {
+      if (!res.ok) { warnIn('mapmWarn', 'err', esc(res.message)); return; }
+      closeModal('mapm'); toast('Сопоставление сохранено'); loadSync();
+    });
+  };
+  function runSync(id, dry) {
+    if (!id) return;
+    warnIn('syncWarn', '', dry ? 'Выполняю предпросмотр (без записи)…' : 'Синхронизирую…');
+    api('/api/sync/run', { id: id, dry: !!dry }).then(function (res) {
+      if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
+      var e = res.entry;
+      if (dry) { SYNC.lastEntry = e; showDryRun(e); }
+      else {
+        warnIn('syncWarn', e.errors && e.errors.length ? 'err' : '',
+          (e.errors && e.errors.length ? '⚠ ' : '✓ ') + 'прогон: прочитано ' + e.read + ', совпало ' + e.matched + ', изменено ' + e.changed + ', пропущено ' + e.skipped +
+          (e.errors && e.errors.length ? ' · ошибок: ' + e.errors.length + ' — ' + esc(String(e.errors[0])).slice(0, 120) : ''));
+        loadSync();
+      }
+    });
+  }
+  function showDryRun(e) {
+    $('syncpSub').textContent = e.mapping + ' · ' + (e.at || '').replace('T', ' ');
+    var err = e.errors || [];
+    warnIn('syncpWarn', err.length ? 'warn' : '', err.length ? 'Замечания: ' + err.slice(0, 5).map(esc).join('<br>') : 'Ошибок нет — можно применять.');
+    $('syncpBody').innerHTML = '<div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:10px">' +
+      ['прочитано: ' + e.read, 'строк реестра найдено: ' + e.matched, 'ячеек изменится: ' + e.changed, 'пропущено: ' + e.skipped].map(function (t) {
+        return '<span class="pill">' + esc(t) + '</span>'; }).join(' ') + '</div>' +
+      '<span class="muted">предпросмотр ничего не менял; кнопка «Применить» выполнит тот же прогон с записью в реестр.</span>';
+    openModal('syncp');
+  }
+  $('syncpApply').onclick = function () {
+    if (!SYNC.lastEntry) return;
+    var m = SYNC.maps.filter(function (x) { return x.name === SYNC.lastEntry.mapping; })[0];
+    closeModal('syncp');
+    runSync(m ? m.id : '', false);
+  };
+  $('syncExport').onclick = function () {
+    api('/api/sync/export', {}).then(function (res) {
+      if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
       var a = document.createElement('a');
-      a.href = 'data:xlsx;base64,' + res.file_b64; a.download = res.name || '1С-OData.xlsx';
+      a.href = 'data:application/json;base64,' + res.file_b64; a.download = res.name || 'Сопоставления 1С.json';
       document.body.appendChild(a); a.click(); a.remove();
-      toast('Выгружено строк: ' + res.rows);
+      toast('Экспортировано сопоставлений: ' + res.count);
     });
   };
-  $('odEntity').onchange = function () {
-    var s = OD.entities[this.value];
-    $('odFilter').placeholder = s && s.props && s.props.length ? 'поля: ' + s.props.slice(0, 30).map(function (p) { return p.name; }).join(', ') : 'например, СуммаДокумента gt 100000';
+  $('syncImportFile').onchange = function () {
+    var f = this.files && this.files[0]; if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function () {
+      var b64 = String(rd.result || '').split(',').pop();
+      api('/api/sync/import', { file_b64: b64 }).then(function (res) {
+        if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
+        warnIn('syncWarn', '', '✓ импорт: добавлено ' + res.added + ', пропущено ' + res.skipped + ' (источник не найден или файл неполный)');
+        loadSync();
+      });
+    };
+    rd.readAsDataURL(f);
+    this.value = '';
   };
 
-  // --- Подключение к 1С без веб-публикации (COM) — Администрирование, только администратор ---
-  var C1 = { list: [], editing: '' };
-  function c1Conn(id) { return C1.list.filter(function (x) { return x.id === id; })[0] || null; }
-  function loadC1() {
+  // =====================================================================
+  // РАСПИСАНИЕ АВТО-СИНХРОНИЗАЦИИ — только админ
+  // =====================================================================
+  function loadSch() {
     if (!(AUTH.user && AUTH.user.admin)) return;
-    api('/api/c1/list', {}).then(function (res) {
-      if (!res.ok) { $('c1Table').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message || 'Нет доступа') + '</td></tr></tbody>'; return; }
-      C1.list = res.items || [];
-      $('c1ModeHint').textContent = res.com
-        ? 'Прямой запуск 1С доступен: на сервере панели есть pywin32 и установлена платформа 1С.'
-        : (res.windows
-          ? 'На сервере панели не установлен pywin32 (pip install pywin32) — прямой запуск 1С недоступен. Параметры можно завести заранее.'
-          : 'Панель работает не на Windows — прямой COM-запуск 1С недоступен, используйте подключения OData. Параметры можно завести заранее.');
-      renderC1Conns();
+    api('/api/sync/maps', {}).then(function (res) {
+      if (!res.ok) { warnIn('schWarn', 'err', esc(res.message || 'Нет доступа')); return; }
+      var s = res.settings || {};
+      $('schEnabled').checked = !!s.enabled;
+      $('schInterval').value = s.interval_min || 60;
+      $('schFrom').value = s.hours_from != null ? s.hours_from : 8;
+      $('schTo').value = s.hours_to != null ? s.hours_to : 20;
+      var wd = s.weekdays || [];
+      Array.prototype.forEach.call($('schDays').querySelectorAll('input'), function (cb) { cb.checked = wd.indexOf(+cb.value) >= 0; });
+      $('schLast').textContent = 'Последний автопрогон: ' + (s.last_run ? String(s.last_run).replace('T', ' ') : 'ещё не выполнялся') +
+        ' · записей в журнале: ' + (res.log || []).length;
+      warnIn('schWarn', '');
     });
   }
-  function renderC1Conns() {
-    $('c1Table').innerHTML = '<thead><tr><th>Название</th><th>Строка соединения</th><th>Модуль.Метод</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
-      (C1.list.length ? C1.list.map(function (x) {
-        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td><td class="l">' + esc(x.connect || '—') + '</td>' +
-          '<td>' + (x.module ? esc(x.module) + (x.method ? '.' + esc(x.method) : '') : '—') + '</td>' +
-          '<td>' + (x.user ? esc(x.user) : '—') + (x.has_password ? ' <span class="pill ok">пароль задан</span>' : '') + '</td>' +
-          '<td>' + (x.enabled ? '<span class="pill ok">включено</span>' : '<span class="pill warn">выключено</span>') +
-            (x.last_check ? '<br><span class="muted">' + (x.last_check.ok ? '✓ ' : '✕ ') + esc((x.last_check.checked_at || '').replace('T', ' ')) + '</span>' : '') + '</td>' +
-          '<td style="white-space:nowrap"><button class="btn sm" data-c1test="' + esc(x.id) + '">Проверить</button> ' +
-          (x.module && x.method ? '<button class="btn sm primary" data-c1call="' + esc(x.id) + '">Вызвать</button> ' : '') +
-          '<button class="btn sm" data-c1edit="' + esc(x.id) + '">Изменить</button></td></tr>';
-      }).join('') : '<tr><td colspan="6" class="empty">Подключений пока нет — нажмите «+ Подключение».</td></tr>') + '</tbody>';
-  }
-  $('c1Add').onclick = function () { openC1Conn(null); };
-  $('c1Table').onclick = function (e) {
-    var t = e.target.closest('[data-c1test]'), cl = e.target.closest('[data-c1call]'), ed = e.target.closest('[data-c1edit]');
-    if (t) c1Test(t.dataset.c1test);
-    else if (cl) c1Call(cl.dataset.c1call);
-    else if (ed) openC1Conn(c1Conn(ed.dataset.c1edit));
-  };
-  function openC1Conn(x) {
-    C1.editing = x ? x.id : '';
-    $('c1mName').value = x ? x.name : ''; $('c1mConnect').value = x ? (x.connect || '') : '';
-    $('c1mServer').value = x ? (x.server || '') : ''; $('c1mBase').value = x ? (x.base || '') : '';
-    $('c1mUser').value = x ? (x.user || '') : ''; $('c1mPass').value = '';
-    $('c1mPassHint').textContent = x && x.has_password ? 'пароль сохранён — оставьте пустым, чтобы не менять' : '';
-    $('c1mModule').value = x ? (x.module || '') : ''; $('c1mMethod').value = x ? (x.method || '') : '';
-    $('c1mParam').value = x ? (x.param || '') : ''; $('c1mDesc').value = x ? (x.desc || '') : '';
-    $('c1mEnabled').checked = x ? !!x.enabled : true;
-    $('c1mDelete').style.display = x ? '' : 'none'; $('c1mDelete').dataset.confirm = ''; $('c1mDelete').textContent = 'Удалить подключение';
-    warnIn('c1mWarn', ''); openModal('c1m');
-  }
-  function c1FormData() {
-    return { id: C1.editing, name: $('c1mName').value.trim(), connect: $('c1mConnect').value.trim(),
-      server: $('c1mServer').value.trim(), base: $('c1mBase').value.trim(), user: $('c1mUser').value.trim(),
-      password: $('c1mPass').value, module: $('c1mModule').value.trim(), method: $('c1mMethod').value.trim(),
-      param: $('c1mParam').value, desc: $('c1mDesc').value.trim(), enabled: $('c1mEnabled').checked };
-  }
-  $('c1mSave').onclick = function () {
-    api('/api/c1/save', c1FormData()).then(function (res) {
-      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
-      closeModal('c1m'); toast('Подключение сохранено'); loadC1();
+  $('schSave').onclick = function () {
+    var wd = Array.prototype.filter.call($('schDays').querySelectorAll('input'), function (cb) { return cb.checked; }).map(function (cb) { return +cb.value; });
+    api('/api/sync/settings', { enabled: $('schEnabled').checked, interval_min: +$('schInterval').value || 60,
+      hours_from: +$('schFrom').value, hours_to: +$('schTo').value, weekdays: wd }).then(function (res) {
+      if (!res.ok) { warnIn('schWarn', 'err', esc(res.message)); return; }
+      warnIn('schWarn', '', '✓ расписание сохранено: каждые ' + res.settings.interval_min + ' мин, в окне ' + res.settings.hours_from + ':00–' + res.settings.hours_to + ':00, ' +
+        (res.settings.enabled ? 'включено' : 'выключено'));
+      toast('Расписание сохранено');
     });
   };
-  $('c1mDelete').onclick = function () {
-    if (this.dataset.confirm !== C1.editing) { this.dataset.confirm = C1.editing; this.textContent = 'Точно удалить?'; return; }
-    api('/api/c1/delete', { id: C1.editing }).then(function (res) {
-      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
-      closeModal('c1m'); toast('Подключение удалено'); loadC1();
-    });
-  };
-  $('c1mCheck').onclick = function () {
-    warnIn('c1mWarn', '', 'Проверяю подключение…');
-    api('/api/c1/check', c1FormData()).then(function (res) {
-      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
-      warnIn('c1mWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || ''));
-    });
-  };
-  function c1Test(id) {
-    warnIn('c1ListWarn', '', 'Проверяю соединение с «' + esc((c1Conn(id) || {}).name || '') + '»…');
-    api('/api/c1/test', { id: id }).then(function (res) {
-      if (!res.ok) { warnIn('c1ListWarn', 'err', esc(res.message)); loadC1(); return; }
-      warnIn('c1ListWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || '')); loadC1();
-    });
-  }
-  function c1Call(id) {
-    var x = c1Conn(id); if (!x) return;
-    warnIn('c1ListWarn', '', 'Вызываю ' + esc(x.module || '') + '.' + esc(x.method || '') + ' в «' + esc(x.name) + '»…');
-    api('/api/c1/call', { id: id }).then(function (res) {
-      if (!res.ok) { warnIn('c1ListWarn', 'err', esc(res.message)); return; }
-      var txt = typeof res.result === 'string' ? res.result : JSON.stringify(res.result, null, 2);
-      warnIn('c1ListWarn', '', '✓ ответ 1С: ' + esc(String(txt == null ? '(пусто)' : txt).slice(0, 500)));
-    });
-  }
+
   // дополнительный член комиссии — только для этого протокола
   $('pm_extra_add').onclick = function () {
     $('pm_extra').insertAdjacentHTML('beforeend', '<div class="xrow"><select><option>Член комиссии</option><option>Заместитель председателя комиссии</option><option>Председатель комиссии</option><option>Секретарь комиссии</option></select>' +
