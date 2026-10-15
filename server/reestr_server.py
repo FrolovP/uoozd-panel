@@ -1872,6 +1872,29 @@ def c1_com_available():
         return False
 
 
+def _com_error_text(e):
+    """Из COM-ошибки pywin32 достаём максимально информативный текст.
+
+    pywintypes.com_error: args = (HRESULT, описание, (источник, описание, файл
+    справки, контекст, код), HRESULT2) — настоящий текст ошибки 1С обычно
+    в excepinfo, а не в первых двух аргументах (там лишь «Ошибка.»)."""
+    parts = []
+    for arg in getattr(e, 'args', ()):
+        if isinstance(arg, tuple):
+            parts.extend(str(x) for x in arg if x and str(x) not in ('None',))
+        elif arg not in (None, ''):
+            parts.append(str(arg))
+    excep = getattr(e, 'excepinfo', None)
+    if excep:
+        parts.extend(str(x) for x in excep if x and str(x) not in ('None',))
+    seen, out = set(), []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return ' | '.join(out) or str(e)
+
+
 def c1_open_connection(connect, timeout=COM_TIMEOUT):
     """Открывает EnterpriseConnector (COM) к базе 1С без веб-публикации.
 
@@ -1895,12 +1918,16 @@ def c1_open_connection(connect, timeout=COM_TIMEOUT):
             pythoncom.CoUninitialize()  # соединение не открылось — освобождаем COM в этом потоке
         except Exception:
             pass
-        text = ' '.join(str(x) for x in e.args[:2]) if getattr(e, 'args', None) else str(e)
+        text = _com_error_text(e)
         low = text.lower()
         if 'класс не зарегистрирован' in low or 'invalid class string' in low or '-2147221164' in low:
             raise ValueError('Платформа 1С не установлена на этом компьютере: COM-класс V83.COMConnector не '
                              'зарегистрирован. Установите платформу 1С той же разрядности, что и Python панели '
                              '(достаточно компонента «COM-соединение» из дистрибутива платформы)') from e
+        if 'несоответствие версий' in low or 'различаются версии' in low:
+            raise ValueError(f'Несоответствие версий платформы 1С: {text[:250]}. На компьютере панели должна быть '
+                             f'зарегистрирована comcntr.dll той же версии платформы, что на сервере '
+                             f'(regsvr32 …\\1cv8\\<версия>\\bin\\comcntr.dll)') from e
         if 'не найдена' in low or 'not found' in low or '-2147' in low and 'база' in low:
             raise ValueError(f'База 1С не найдена по строке «{c1_hide_secret(connect)}» — проверьте путь и имя базы') from e
         if 'логин' in low or 'пользовател' in low or 'login' in low:
