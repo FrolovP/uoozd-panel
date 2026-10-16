@@ -1783,85 +1783,24 @@ def odata_api(path, data, user):
 
 
 # =====================================================================
-# БАЗЫ 1С БЕЗ ВЕБ-ПУБЛИКАЦИИ — прямое COM-соединение (V83.COMConnector)
-# Второй вариант подключения для баз, которые не опубликованы как OData:
-# панель (Windows-сервер с установленной платформой 1С той же разрядности,
-# что и Python) открывает соединение по строке вида
-#   File="C:\Базы\Закупки";Usr="Имя";Pwd="пароль";           — файловая база
-#   Srvr="srv1c:1541";Ref="Закупки";Usr="Имя";Pwd="пароль";  — клиент-серверная
-# и вызывает общий модуль 1С через COM. Требует pywin32 (pythoncom) на машине
-# панели; на Linux/Mac раздел показывает подсказку и позволяет завести/проверить
-# параметры подключения.
-# Хранение: «Панель — подключения 1С прямые.json». Пароль доступа хранится
-# рядом с панелью — доступ к файлу должен быть только у сервера.
+# ПОДДЕРЖКА ПРЯМОГО COM-СОЕДИНЕНИЯ С 1С УДАЛЕНА
+# Транспорт V83.COMConnector (pywin32) работал только на Windows и не мог
+# работать на Linux/macOS. Вместо него для баз без веб-публикации
+# используется MCP-транспорт (python-прокси src/py_server + расширение
+# mcp.cfe в базе 1С) либо публикация OData.
+# Старые файлы «Панель — подключения 1С прямые.json» при первом запуске
+# мигрируются в единый список источников; записи с transport='com'
+# помечаются выключенными с пояснением (см. src_migrate_once).
+# Ниже оставлены только pure-python утилиты маскировки секретов в старых
+# строках соединения (Pwd="…") — они нужны для журнала и списка источников.
 # =====================================================================
 
-ФАЙЛ_1С_ПРЯМЫЕ = 'Панель — подключения 1С прямые.json'
-COM_TIMEOUT = 60                 # секунд на вызов общего модуля 1С
-_1c_lock = threading.Lock()
+ФАЙЛ_1С_ПРЯМЫЕ = 'Панель — подключения 1С прямые.json'   # только для миграции старых подключений
 
 
-def c1_load_raw():
-    rows = _json_file(ФАЙЛ_1С_ПРЯМЫЕ, [])
-    return rows if isinstance(rows, list) else []
-
-
-def c1_save_raw(rows):
-    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_1С_ПРЯМЫЕ, json.dumps(rows, ensure_ascii=False, indent=1))
-
-
-def c1_public(rec):
-    """Для браузера: без пароля доступа, с признаком «пароль задан» и строкой соединения без секрета."""
-    out = {k: rec.get(k) for k in ('id', 'name', 'base', 'server', 'user', 'desc', 'module', 'method', 'param',
-                                   'enabled', 'created_at', 'updated_at', 'last_check')}
-    out['connect'] = c1_hide_secret(rec.get('connect'))
-    out['has_password'] = bool(rec.get('password')) or bool(c1_split_password(rec.get('connect')))
-    return out
-
-
-def c1_form_data(rec):
-    """Что подставить в форму при повторной проверке/вызове (без Pwd из строки)."""
-    d = c1_public(rec)
-    connect = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', str(rec.get('connect') or ''), flags=re.IGNORECASE)
-    d['connect'] = connect
-    d['password'] = str(rec.get('password') or '') or c1_split_password(str(rec.get('connect') or ''))
-    return d
-
-
-def c1_norm_connect(s):
-    """Строка соединения V83.COMConnector → нормализованный вид с кавычками и «;» в конце.
-
-    Реальный формат COM-соединителя 1С:
-      файловая база        File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль";
-      клиент-серверная     Srvr="srv1c:1541";Ref="ИмяБазы";Usr="Имя";Pwd="пароль";
-    Значения принимаются в кавычках и без; параметры пересобираются в канонический вид."""
-    t = str(s or '').strip().rstrip(';').strip()
-    if not t:
-        raise ValueError('Не указана строка соединения с базой 1С')
-    pairs = []
-    pos = 0
-    for m in re.finditer(r'(\w+)\s*=\s*(?:"([^"]*)"|([^;]*))', t):
-        if t[pos:m.start()].strip(' ;'):
-            raise ValueError('Строка соединения должна быть вида File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль"; '
-                             'или Srvr="сервер";Ref="имя базы";Usr="Имя";Pwd="пароль";')
-        if m.group(2) is None and ',' in (m.group(3) or ''):
-            raise ValueError('Похоже на строку старого формата с запятыми. COM-соединитель 1С принимает параметры '
-                             'через «;»: File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль";')
-        pairs.append((m.group(1), m.group(2) if m.group(2) is not None else (m.group(3) or '').strip()))
-        pos = m.end()
-    if t[pos:].strip(' ;') or not pairs:
-        raise ValueError('Строка соединения должна быть вида File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль"; '
-                         'или Srvr="сервер";Ref="имя базы";Usr="Имя";Pwd="пароль";')
-    keys = [k.lower() for k, _ in pairs]
-    if len(set(keys)) != len(keys):
-        raise ValueError('В строке соединения параметр указан дважды')
-    if 'file' in keys:
-        pass
-    elif 'srvr' in keys and 'ref' in keys:
-        pass
-    else:
-        raise ValueError('Укажите File="путь к каталогу базы" (файловая база) или Srvr="сервер";Ref="имя базы" (клиент-серверная)')
-    return ';'.join(f'{k}="{v}"' for k, v in pairs) + ';'
+def c1_hide_secret(connect):
+    """Строка соединения без секрета (Pwd="••••") — для сообщений об ошибках и журнала."""
+    return re.sub(r'(Pwd\s*=\s*")[^"]*(")', r'\1••••\2', str(connect or ''), flags=re.IGNORECASE)
 
 
 def c1_split_password(connect):
@@ -1870,374 +1809,14 @@ def c1_split_password(connect):
     return m.group(1) if m else ''
 
 
-def c1_is_windows():
-    return os.name == 'nt'
-
-
-def c1_com_available():
-    """Есть ли на машине панели pythoncom (pywin32) — прямой запуск 1С возможен только с ним."""
-    try:
-        import pythoncom  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _com_error_text(e):
-    """Из COM-ошибки pywin32 достаём максимально информативный текст.
-
-    pywintypes.com_error: args = (HRESULT, описание, (источник, описание, файл
-    справки, контекст, код), HRESULT2) — настоящий текст ошибки 1С обычно
-    в excepinfo, а не в первых двух аргументах (там лишь «Ошибка.»)."""
-    parts = []
-    for arg in getattr(e, 'args', ()):
-        if isinstance(arg, tuple):
-            parts.extend(str(x) for x in arg if x and str(x) not in ('None',))
-        elif arg not in (None, ''):
-            parts.append(str(arg))
-    excep = getattr(e, 'excepinfo', None)
-    if excep:
-        parts.extend(str(x) for x in excep if x and str(x) not in ('None',))
-    seen, out = set(), []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return ' | '.join(out) or str(e)
-
-
-def c1_open_connection(connect, timeout=COM_TIMEOUT):
-    """Открывает EnterpriseConnector (COM) к базе 1С без веб-публикации.
-
-    Возвращает объект соединения; ошибки превращает в понятный текст.
-    Вызывается из потока HTTP-сервера: COM в потоке инициализируется здесь
-    (CoInitialize), а освобождается вызывающим кодом — pythoncom.CoUninitialize()
-    после закрытия соединения."""
-    try:
-        import win32com.client
-        import pythoncom
-    except ImportError as e:
-        raise ValueError('На компьютере панели не установлен pywin32 — прямой запуск 1С невозможен. '
-                         'Установите: pip install pywin32 (нужна Windows с установленной платформой 1С)') from e
-    connect = c1_norm_connect(connect)
-    pythoncom.CoInitialize()  # COM обязателен к инициализации в каждом потоке — сервер многопоточный
-    try:
-        coord = win32com.client.Dispatch('V83.COMConnector', clsctx=pythoncom.CLSCTX_LOCAL_SERVER)
-        conn = coord.Connect(connect)
-    except Exception as e:
-        try:
-            pythoncom.CoUninitialize()  # соединение не открылось — освобождаем COM в этом потоке
-        except Exception:
-            pass
-        text = _com_error_text(e)
-        low = text.lower()
-        if 'класс не зарегистрирован' in low or 'invalid class string' in low or '-2147221164' in low:
-            raise ValueError('Платформа 1С не установлена на этом компьютере: COM-класс V83.COMConnector не '
-                             'зарегистрирован. Установите платформу 1С той же разрядности, что и Python панели '
-                             '(достаточно компонента «COM-соединение» из дистрибутива платформы)') from e
-        if 'несоответствие версий' in low or 'различаются версии' in low:
-            raise ValueError(f'Несоответствие версий платформы 1С: {text[:250]}. На компьютере панели должна быть '
-                             f'зарегистрирована comcntr.dll той же версии платформы, что на сервере '
-                             f'(regsvr32 …\\1cv8\\<версия>\\bin\\comcntr.dll)') from e
-        if 'не найдена' in low or 'not found' in low or '-2147' in low and 'база' in low:
-            raise ValueError(f'База 1С не найдена по строке «{c1_hide_secret(connect)}» — проверьте путь и имя базы') from e
-        if 'логин' in low or 'пользовател' in low or 'login' in low:
-            raise ValueError(f'1С отклонила пользователя «{text}»'.rstrip('» ') + ' — проверьте имя пользователя и пароль') from e
-        if 'лиценз' in low or 'license' in low:
-            raise ValueError('1С отказала: нет лицензии на подключение через COM — проверьте лицензию технологического сервера') from e
-        raise ValueError(f'1С не ответила на прямое подключение: {text[:300]}') from e
-    if conn is None:
-        raise ValueError('1С вернула пустое соединение — база открыта в монопольном режиме или недоступна')
-    return conn
-
-
-def c1_hide_secret(connect):
-    """Строка соединения без секрета (Pwd="••••") — для сообщений об ошибках и журнала."""
-    return re.sub(r'(Pwd\s*=\s*")[^"]*(")', r'\1••••\2', str(connect or ''), flags=re.IGNORECASE)
-
-
-def c1_call(conn, module, method, param):
-    """Вызов общего модуля 1С через COM: conn.<Модуль>.<Метод>(param) → ответ.
-
-    Общий модуль — свойство объекта соединения (не функция): вызывать сам объект
-    модуля нельзя, метод берётся прямо с него. Чтобы модуль был доступен через
-    внешнее соединение, в конфигураторе у него должны стоять флаги «Сервер» и
-    «Внешнее соединение», а у процедуры/функции — признак «Экспорт»."""
-    mod = str(module or '').strip()
-    met = str(method or '').strip()
-    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*', mod):
-        raise ValueError('Имя общего модуля 1С может состоять только из букв, цифр и подчёркивания')
-    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*', met):
-        raise ValueError('Имя процедуры/функции 1С может состоять только из букв, цифр и подчёркивания')
-    try:
-        obj = getattr(conn, mod)
-    except AttributeError as e:
-        raise ValueError(f'Общий модуль «{mod}» в конфигурации 1С не найден или недоступен через внешнее соединение — '
-                         f'проверьте имя модуля и его флаги «Сервер»/«Внешнее соединение»') from e
-    try:
-        fn = getattr(obj, met)
-    except Exception as e:
-        raise ValueError(f'Модуль «{mod}» доступен, но экспортной процедуры/функции «{met}» в нём нет: {str(e)[:200]}') from e
-    try:
-        res = fn(param) if str(param or '') != '' else fn()
-    except Exception as e:
-        raise ValueError(f'1С выполнила «{mod}.{met}» с ошибкой: {str(e)[:300]}') from e
-    return res
-
-
-def c1_result_to_jsonable(v):
-    """Ответ 1С (строка/число/булево/ТаблицаЗначений/Массив) → обычный Python для JSON."""
-    if v is None or isinstance(v, (str, int, float, bool)):
-        return v
-    s = str(v)
-    if s.startswith('{') or s.startswith('['):
-        try:
-            return json.loads(s)
-        except ValueError:
-            pass
-    return s
-
-
-def c1_assemble(data):
-    """Собрать строку соединения V83.COMConnector из полей формы.
-
-    Готовая строка в поле connect имеет приоритет. Иначе: «сервер + имя базы»
-    → Srvr="сервер";Ref="база"; (клиент-серверная), только «путь к базе»
-    → File="путь"; (файловая). Пользователь и пароль добавляются параметрами
-    Usr="/Pwd=" — если их ещё нет в строке."""
-    connect = str(data.get('connect') or '').strip()
-    base = str(data.get('base') or '').strip().strip('"')
-    server = str(data.get('server') or '').strip().strip('"')
-    user = str(data.get('user') or '').strip().strip('"')
-    password = str(data.get('password') or '')
-    if not connect and base:
-        if server:
-            connect = f'Srvr="{server}";Ref="{base}";'
-        else:
-            connect = f'File="{base}";'
-    if connect:
-        low = connect.lower()
-        if user and not re.search(r'\busr\s*=', low):
-            connect = connect.rstrip(';').rstrip() + f';Usr="{user}";'
-        if password and not re.search(r'\bpwd\s*=', low):
-            connect = connect.rstrip(';').rstrip() + f';Pwd="{password}";'
-    return connect
-
-
-def c1_conn_check(data, actor):
-    """Проверка прямого подключения по данным формы → {'ok','message','checked_at'}."""
-    checked_at = datetime.now().isoformat(timespec='seconds')
-    res = {'ok': False, 'message': '', 'checked_at': checked_at}
-    data = dict(data or {})
-    old = c1_find(str(data.get('id') or '')) if data.get('id') else None
-    # если пароль не вводили — берём сохранённый из записи (или из сохранённой строки)
-    if not str(data.get('password') or ''):
-        if old:
-            saved_pw = str(old.get('password') or '') or c1_split_password(str(old.get('connect') or ''))
-            if saved_pw and 'Pwd=' not in str(data.get('connect') or ''):
-                data['password'] = saved_pw
-    connect = c1_assemble(data)
-    try:
-        connect = c1_norm_connect(connect)
-    except ValueError as e:
-        res['message'] = str(e)
-        return res
-    if not c1_is_windows():
-        res['message'] = ('Строка соединения корректна. Сама проверка прямым запуском выполняется только на Windows-'
-                          'сервере с установленной платформой 1С — на этом компьютере панель работает без COM 1С, '
-                          'используйте подключения OData')
-        return res
-    if not c1_com_available():
-        res['message'] = 'На компьютере панели не установлен pywin32 (pip install pywin32) — прямой запуск 1С недоступен'
-        return res
-    try:
-        conn = c1_open_connection(connect)
-    except ValueError as e:
-        res['message'] = str(e)
-        return res
-    try:
-        note = 'Соединение с базой установлено'
-        mod, met = str(data.get('module') or '').strip(), str(data.get('method') or '').strip()
-        if mod or met:
-            if not (mod and met):
-                res['message'] = note + ' ✓. Для проверки обмена заполните и модуль, и процедуру 1С — или оставьте оба пустыми'
-                res['ok'] = True
-                return res
-            raw = c1_call(conn, mod, met, data.get('param'))
-            val = c1_result_to_jsonable(raw)
-            preview = json.dumps(val, ensure_ascii=False)[:500] if not isinstance(val, str) else val[:500]
-            note += f', ответ 1С «{mod}.{met}»: {preview or "(пусто)"}'
-        res['ok'] = True
-        res['message'] = note
-    except ValueError as e:
-        res['message'] = f'Соединение с базой установлено ✓, но {e}'
-    finally:
-        conn = None  # у COM-соединения 1С нет метода Disconnect — оно закрывается освобождением объекта
-        try:
-            import pythoncom
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
-    return res
-
-
-def c1_find(conn_id):
-    for x in c1_load_raw():
-        if x.get('id') == conn_id:
-            return x
-    return None
-
-
-def c1_save_last_check(conn_id, check):
-    with _1c_lock:
-        rows = c1_load_raw()
-        hit = False
-        for x in rows:
-            if x.get('id') == conn_id:
-                x['last_check'] = check
-                hit = True
-        if hit:
-            c1_save_raw(rows)
-
-
-def c1_save_conn(data, actor):
-    """Создание/изменение прямого подключения администратором."""
-    with _1c_lock:
-        rows = c1_load_raw()
-        cid = str(data.get('id') or '').strip()
-        if not cid:
-            cid = re.sub(r'[^a-z0-9_-]', '', str(data.get('name') or 'c1').lower())[:40] or 'c1'
-            base_id, n = cid, 2
-            while any(x.get('id') == cid for x in rows):
-                cid = f'{base_id}-{n}'
-                n += 1
-        old = next((x for x in rows if x.get('id') == cid), None)
-        name = str(data.get('name') or '').strip()
-        if not name:
-            raise ValueError('Название подключения обязательно')
-        data = dict(data)
-        if not str(data.get('password') or '') and old:
-            saved_pw = str(old.get('password') or '') or c1_split_password(str(old.get('connect') or ''))
-            if saved_pw:
-                data['password'] = saved_pw
-        connect = c1_norm_connect(c1_assemble(data))
-        pwd = str(data.get('password') or '') or c1_split_password(connect)
-        # секрет храним только в отдельном поле — в сохранённой строке соединения его быть не должно
-        connect = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', connect, flags=re.IGNORECASE)
-        rec = {
-            'id': cid,
-            'name': name[:120],
-            'connect': connect,
-            'base': str(data.get('base') or '').strip()[:120],
-            'server': str(data.get('server') or '').strip()[:120],
-            'user': str(data.get('user') or '').strip()[:120],
-            'password': pwd,
-            'desc': str(data.get('desc') or '').strip()[:300],
-            'module': str(data.get('module') or '').strip()[:120],
-            'method': str(data.get('method') or '').strip()[:120],
-            'param': str(data.get('param') or '')[:2000],
-            'enabled': bool(data.get('enabled', True)),
-            'created_at': (old or {}).get('created_at') or datetime.now().isoformat(timespec='seconds'),
-            'updated_at': datetime.now().isoformat(timespec='seconds'),
-            'last_check': (old or {}).get('last_check'),
-        }
-        if old:
-            rows = [rec if x.get('id') == cid else x for x in rows]
-        else:
-            rows.append(rec)
-        c1_save_raw(rows)
-        log('edit', f"1С прямое: подключение «{rec['name']}» ({c1_hide_secret(connect)}) сохранено",
-            user=(actor or {}).get('fio') or 'панель')
-        return c1_public(rec)
-
-
-def c1_delete_conn(conn_id, actor):
-    with _1c_lock:
-        rows = c1_load_raw()
-        rec = next((x for x in rows if x.get('id') == conn_id), None)
-        if not rec:
-            raise ValueError('Подключение не найдено')
-        c1_save_raw([x for x in rows if x.get('id') != conn_id])
-        log('edit', f"1С прямое: подключение «{rec['name']}» удалено", user=(actor or {}).get('fio') or 'панель')
-
-
-def c1_api(path, data, user):
-    """Эндпоинты раздела: POST /api/c1/…  (все — только для администратора)."""
-    if not user.get('admin'):
-        raise PermissionError('Раздел «Подключение к 1С» доступен только администратору')
-    if path == '/api/c1/list':
-        return {'ok': True, 'items': [c1_public(x) for x in c1_load_raw()],
-                'windows': c1_is_windows(), 'com': c1_com_available()}
-    if path == '/api/c1/save':
-        return {'ok': True, 'item': c1_save_conn(data, user)}
-    if path == '/api/c1/delete':
-        c1_delete_conn(str(data.get('id') or ''), user)
-        return {'ok': True}
-    if path == '/api/c1/check':
-        check = c1_conn_check(data, user)
-        if data.get('id'):
-            c1_save_last_check(str(data.get('id')), check)
-            log('info' if check['ok'] else 'error',
-                f"1С прямое: проверка «{(c1_find(str(data['id'])) or {}).get('name') or data.get('id')}» — {check['message']}",
-                user=user.get('fio') or 'панель')
-        return {'ok': True, **check}
-    if path == '/api/c1/test':
-        rec = c1_find(str(data.get('id') or ''))
-        if not rec:
-            raise ValueError('Подключение не найдено')
-        check = c1_conn_check(c1_form_data(rec), user)
-        c1_save_last_check(rec['id'], check)
-        log('info' if check['ok'] else 'error', f"1С прямое: проверка «{rec['name']}» — {check['message']}",
-            user=user.get('fio') or 'панель')
-        if not check['ok']:
-            raise ValueError(check['message'])
-        return {'ok': True, **check}
-    if path == '/api/c1/call':
-        rec = c1_find(str(data.get('id') or ''))
-        if not rec:
-            raise ValueError('Подключение не найдено')
-        if not rec.get('enabled'):
-            raise ValueError('Подключение отключено администратором')
-        if not c1_is_windows() or not c1_com_available():
-            raise ValueError('Прямое подключение к 1С работает только на Windows-сервере панели с pywin32 и установленной платформой 1С')
-        conn = c1_open_connection(c1_norm_connect(c1_assemble(c1_form_data(rec))))
-        try:
-            res = c1_call(conn, data.get('module') or rec.get('module'),
-                          data.get('method') or rec.get('method'), data.get('param', rec.get('param')))
-        finally:
-            conn = None  # COM-соединение закрывается освобождением объекта
-            try:
-                import pythoncom
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-        log('info', f"1С прямое: «{rec['name']}» вызван {data.get('module') or rec.get('module')}.{data.get('method') or rec.get('method')}",
-            user=user.get('fio') or 'панель')
-        return {'ok': True, 'result': c1_result_to_jsonable(res)}
-    raise ValueError('Нет такой команды прямого подключения 1С')
-
-
-def odata_xlsx_bytes(res):
-    """Выгрузка результата OData-запроса в .xlsx (openpyxl)."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = (res.get('entity') or 'OData')[:31]
-    ws.append(res.get('columns') or [])
-    for c in ws[1]:
-        c.font = Font(bold=True)
-    for row in res.get('rows') or []:
-        ws.append(row)
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
 # =====================================================================
 # ЕДИНЫЕ ИСТОЧНИКИ 1С (Администрирование → Настройка источников)
 # Список из N источников с индивидуальными параметрами; транспорты:
 #   odata — публикация OData (параметры как у старых подключений),
-#   com   — прямое COM-соединение (File="…"; / Srvr="…";Ref="…"),
 #   mcp   — Python-прокси MCP-сервера 1С (JSON-RPC tools/call на http://…/mcp).
+# Транспорт 'com' (прямой V83.COMConnector) удалён — панель кроссплатформенна
+# (Windows/Linux/macOS); старые COM-подключения при миграции сохраняются в
+# списке выключенными только ради истории параметров.
 # Хранение: «Панель — источники 1С.json». Запись:
 #   {"id","name","transport","params":{…},"enabled","created_at","updated_at","last_check"}
 # Старые файлы подключений при первом запуске мигрируются сюда автоматически.
@@ -2245,7 +1824,9 @@ def odata_xlsx_bytes(res):
 #                     src_rows(rec, filt, orderby, top, skip, watermark) → {'columns','rows','total'}.
 # =====================================================================
 
-SRC_TRANSPORTS = ('odata', 'com', 'mcp')
+SRC_TRANSPORTS = ('odata', 'mcp')
+LEGACY_TRANSPORTS = ('com',)   # унаследованные записи (только просмотр; обращения запрещены)
+LEGACY_TRANSPORTS = ('com',)   # унаследованные записи в списке источников (только просмотр, обращения запрещены)
 
 
 def src_load_raw():
@@ -2270,12 +1851,17 @@ def src_migrate_once():
                           'params': p, 'enabled': bool(x.get('enabled', True)),
                           'created_at': x.get('created_at'), 'updated_at': x.get('updated_at'),
                           'last_check': x.get('last_check')})
-        for x in c1_load_raw():
+        for x in _json_file(ФАЙЛ_1С_ПРЯМЫЕ, []) or []:
+            if not isinstance(x, dict):
+                continue
             p = {k: x.get(k) for k in ('connect', 'base', 'server', 'user', 'password', 'desc', 'module', 'method', 'param')}
+            # COM-транспорт удалён (работал только на Windows) — переносим выключенными ради истории параметров
             moved.append({'id': f"c1-{x.get('id')}", 'name': x.get('name'), 'transport': 'com',
-                          'params': p, 'enabled': bool(x.get('enabled', True)),
+                          'params': p, 'enabled': False,
                           'created_at': x.get('created_at'), 'updated_at': x.get('updated_at'),
-                          'last_check': x.get('last_check')})
+                          'last_check': {'ok': False, 'checked_at': datetime.now().isoformat(timespec='seconds'),
+                                         'message': 'COM-транспорт удалён — панель кроссплатформенна (Windows/Linux/macOS). '
+                                                    'Пересоздайте источник на OData или MCP'}})
         if not moved:
             return
         src_save_raw(moved)
@@ -2313,8 +1899,11 @@ def src_public(rec):
 def src_norm(rec):
     """Проверка и нормализация записи источника по транспорту."""
     t = str(rec.get('transport') or '').strip().lower()
+    if t in LEGACY_TRANSPORTS:
+        raise ValueError('Прямое COM-подключение к 1С удалено из панели (работало только на Windows). '
+                         'Для баз без веб-публикации используйте MCP-прокси, либо опубликуйте OData в 1С')
     if t not in SRC_TRANSPORTS:
-        raise ValueError('Неизвестный транспорт источника — выберите OData, прямое COM или MCP')
+        raise ValueError('Неизвестный транспорт источника — выберите OData или MCP')
     p = dict(rec.get('params') or {})
     if t == 'odata':
         p['base'] = odata_norm_url(p.get('base'))
@@ -2324,13 +1913,6 @@ def src_norm(rec):
         p['orderby'] = str(p.get('orderby') or '').strip()[:200]
         p['top'] = max(1, min(int(p.get('top') or ODATA_PAGE), 1000))
         p['ignore_cert'] = bool(p.get('ignore_cert'))
-    elif t == 'com':
-        p['connect'] = c1_norm_connect(c1_assemble(p))
-        p['connect'] = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', p['connect'], flags=re.IGNORECASE)
-        p['module'] = str(p.get('module') or '').strip()[:120]
-        p['method'] = str(p.get('method') or '').strip()[:120]
-        p['param'] = str(p.get('param') or '')[:2000]
-        p['desc'] = str(p.get('desc') or '').strip()[:300]
     else:  # mcp — python-прокси MCP-сервера 1С
         u = str(p.get('proxy_url') or '').strip()
         if not u:
@@ -2509,32 +2091,6 @@ def _src_odata_rec(rec):
             'enabled': rec.get('enabled', True), 'ignore_cert': p.get('ignore_cert')}
 
 
-def _src_com_conn(rec):
-    """Открыть COM-соединение по источнику; вызывающий обязан закрыть (CoUninitialize)."""
-    p = rec.get('params') or {}
-    form = {'connect': p.get('connect'), 'server': p.get('server'), 'base': p.get('base'),
-            'user': p.get('user'), 'password': p.get('password')}
-    connect = c1_norm_connect(c1_assemble(form))
-    if p.get('password') and not re.search(r'\bpwd\s*=', connect, re.I):
-        connect = connect.rstrip(';') + f';Pwd="{p["password"]}";'
-    return c1_open_connection(connect)
-
-
-def _src_com_table(rec, module, method, param):
-    """COM: вызвать модуль.метод(param) и привести ответ к {'columns','rows','total'}."""
-    conn = _src_com_conn(rec)
-    try:
-        res = c1_result_to_jsonable(c1_call(conn, module, method, param))
-    finally:
-        conn = None
-        try:
-            import pythoncom
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
-    return _as_table(res)
-
-
 def _as_table(res):
     """Разнообразный ответ 1С/MCP → таблица {'columns','rows','total'}."""
     if isinstance(res, dict) and 'columns' in res:
@@ -2572,10 +2128,7 @@ def src_fields(rec):
         q = odata_query(_src_odata_rec(rec), top=1)      # хотя бы одна строка → колонки
         return [{'name': c, 'label': c} for c in q['columns']]
     if t == 'com':
-        if not c1_is_windows() or not c1_com_available():
-            raise ValueError('Прямое COM-подключение доступно только на Windows-сервере панели с pywin32 и платформой 1С')
-        q = _src_com_table(rec, p.get('module'), p.get('method'), p.get('param'))
-        return [{'name': c, 'label': c} for c in q['columns']]
+        raise ValueError('Транспорт прямого COM удалён из панели — источник нужно пересоздать на OData или MCP')
     # mcp: структура метаданных выбранного документа
     obj = str(p.get('metadata_object') or '').strip()
     if not obj:
@@ -2612,13 +2165,7 @@ def src_rows(rec, filt=None, orderby=None, top=None, skip=0, watermark=None):
                            orderby=str(orderby if orderby is not None else (p.get('orderby') or '')) or None,
                            top=top, skip=skip)
     if t == 'com':
-        if not c1_is_windows() or not c1_com_available():
-            raise ValueError('Прямое COM-подключение доступно только на Windows-сервере панели с pywin32')
-        param = str(p.get('param') or '')
-        if watermark and watermark[1]:
-            param = json.dumps({'filter_field': watermark[0], 'filter_value': str(watermark[1]),
-                                'param': param}, ensure_ascii=False)
-        return _src_com_table(rec, p.get('module'), p.get('method'), param)
+        raise ValueError('Транспорт прямого COM удалён из панели — источник нужно пересоздать на OData или MCP')
     # mcp
     args = {}
     wf = str(p.get('watermark_field') or '').strip()
@@ -2649,11 +2196,8 @@ def src_check(rec, actor):
             r['checked_at'] = checked_at
             return r
         if t == 'com':
-            form = {'connect': p.get('connect'), 'server': p.get('server'), 'base': p.get('base'),
-                    'user': p.get('user'), 'password': p.get('password')}
-            r = c1_conn_check(form, actor)
-            r['checked_at'] = checked_at
-            return r
+            return {'ok': False, 'checked_at': checked_at,
+                    'message': 'COM-транспорт удалён (панель кроссплатформенна) — пересоздайте источник на OData или MCP'}
         mcp_ensure_init(rec)
         info = mcp_rpc(rec, 'tools/list', {}, timeout=20) or {}
         names = [x.get('name') for x in info.get('tools') or []]
@@ -2671,8 +2215,7 @@ def src_api(path, data, user):
     if not user.get('admin'):
         raise PermissionError('«Настройка источников» доступна только администратору')
     if path == '/api/src/list':
-        return {'ok': True, 'items': [src_public(x) for x in src_load_raw()],
-                'windows': c1_is_windows(), 'com': c1_com_available()}
+        return {'ok': True, 'items': [src_public(x) for x in src_load_raw()]}
     if path == '/api/src/save':
         return {'ok': True, 'item': src_save(data, user)}
     if path == '/api/src/delete':
@@ -10009,8 +9552,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {'ok': True, **dirs_payload()})
             elif path.startswith('/api/odata/'):
                 self.send_json(200, odata_api(path, data, user))
-            elif path.startswith('/api/c1/'):
-                self.send_json(200, c1_api(path, data, user))
             elif path.startswith('/api/src/'):
                 self.send_json(200, src_api(path, data, user))
             elif path.startswith('/api/sync/'):
@@ -10354,7 +9895,12 @@ def main():
     threading.Thread(target=watch_folder, daemon=True).start()
     threading.Thread(target=watch_sync, daemon=True).start()   # планировщик авто-синхронизации 1С
     if ОТКРЫТЬ_ПАНЕЛЬ:
-        threading.Timer(1.0, lambda: webbrowser.open(f'http://localhost:{ПОРТ}')).start()
+        def _open_browser():
+            try:
+                webbrowser.open(f'http://localhost:{ПОРТ}')
+            except Exception:      # headless-сервер без браузера (в т.ч. Linux) — не критично
+                pass
+        threading.Timer(1.0, _open_browser).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -12007,7 +11553,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     </div>
   </section>
   <section class="card adm-pane" data-pane="src" hidden>
-    <h2>Источники данных 1С <span class="muted">список из N источников: OData, прямое COM или MCP-прокси; видят и настраивают только администраторы</span></h2>
+    <h2>Источники данных 1С <span class="muted">список из N источников: OData или MCP-прокси; видят и настраивают только администраторы</span></h2>
     <div class="toolbar"><span class="muted" id="srcModeHint">Каждый источник — отдельный способ подключения со своими параметрами. Хранятся в папке панели; пароли в браузер не отдаются.</span><span class="grow"></span><button class="btn primary" id="srcAdd">+ Источник</button></div>
     <div class="tablewrap"><table class="at" id="srcTable"></table></div>
     <div class="warnbox" id="srcListWarn" style="margin:8px 0 0"></div>
@@ -12270,7 +11816,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   </div>
 </div>
 
-<!-- ИСТОЧНИК ДАННЫХ 1С (OData / COM / MCP) — новый раздел «Настройка источников» -->
+<!-- ИСТОЧНИК ДАННЫХ 1С (OData / MCP) — раздел «Настройка источников» -->
 <div class="modal" id="srcm" role="dialog" aria-modal="true" aria-labelledby="srcmTitle">
   <div class="sheet" style="width:min(700px,100%)">
     <div class="sheet-head"><h2 id="srcmTitle">Источник данных 1С</h2><span class="muted" id="srcmSub"></span><button class="btn x" data-close="srcm" aria-label="Закрыть">✕</button></div>
@@ -12280,7 +11826,6 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <div class="f full"><label>Транспорт подключения</label>
         <div class="seg" id="srcmTransport" style="width:auto">
           <button type="button" data-tr="odata" aria-pressed="true">OData</button>
-          <button type="button" data-tr="com" aria-pressed="false">Прямое COM</button>
           <button type="button" data-tr="mcp" aria-pressed="false">MCP-прокси</button>
         </div>
         <div class="hint" id="srcmTrHint"></div></div>
@@ -12293,17 +11838,6 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
         <div class="f full"><label for="srcmFilter">Фильтр по умолчанию ($filter)</label><input id="srcmFilter" placeholder="можно оставить пустым"></div>
         <div class="f full"><label for="srcmOrderby">Сортировка по умолчанию ($orderby)</label><input id="srcmOrderby" placeholder="например, Дата desc"></div>
         <label class="chk full"><input type="checkbox" id="srcmIgnoreCert"> не проверять сертификат при https (для самоподписанных)</label>
-      </div>
-      <div class="tr-block" data-for="com" hidden style="display:contents">
-        <div class="f full"><label for="srcmConnect">Готовая строка соединения</label><input id="srcmConnect" placeholder='File="C:\Базы\Закупки";Usr="Иванов"' autocomplete="off"><div class="hint">файловая база: File="путь к каталогу"; · клиент-серверная: Srvr="сервер";Ref="имя базы"; — можно оставить пустым и заполнить поля ниже</div></div>
-        <div class="f"><label for="srcmServer">Сервер 1С</label><input id="srcmServer" placeholder="srv1c:1541 — пусто = файловая база" autocomplete="off"></div>
-        <div class="f"><label for="srcmCbase">Путь к базе / имя базы</label><input id="srcmCbase" placeholder="C:\Базы\Закупки или имя на сервере" autocomplete="off"></div>
-        <div class="f"><label for="srcmUser">Пользователь 1С</label><input id="srcmUser" autocomplete="off"></div>
-        <div class="f"><label for="srcmCpass">Пароль</label><input id="srcmCpass" type="password" autocomplete="new-password"><div class="hint" id="srcmCpassHint"></div></div>
-        <div class="f"><label for="srcmModule">Общий модуль 1С</label><input id="srcmModule" placeholder="например, УООЗД_Интеграция" autocomplete="off"></div>
-        <div class="f"><label for="srcmMethod">Экспортная функция/процедура</label><input id="srcmMethod" placeholder="например, ПолучитьРеестрЗакупок" autocomplete="off"></div>
-        <div class="f full"><label for="srcmParam">Параметр вызова (строка)</label><input id="srcmParam" placeholder="можно оставить пустым" autocomplete="off"></div>
-        <div class="f full"><label for="srcmDesc">Комментарий</label><input id="srcmDesc" placeholder="зачем этот источник" autocomplete="off"></div>
       </div>
       <div class="tr-block" data-for="mcp" hidden style="display:contents">
         <div class="f full"><label for="srcmProxy">Адрес MCP-прокси <span class="req">*</span></label><input id="srcmProxy" placeholder="http://хост:8085/mcp" autocomplete="off"><div class="hint">python-прокси MCP-сервера 1С (src/py_server): stdio-режим не подходит — нужен HTTP-эндпоинт /mcp</div></div>
@@ -17508,27 +17042,26 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   $('admTabs').onclick = function (e) { var b = e.target.closest('[data-adm]'); if (b) setAdmTab(b.dataset.adm); };
 
   // =====================================================================
-  // НАСТРОЙКА ИСТОЧНИКОВ 1С (OData / прямое COM / MCP-прокси) — только админ
+  // НАСТРОЙКА ИСТОЧНИКОВ 1С (OData / MCP-прокси) — только админ
   // =====================================================================
-  var SRC = { list: [], editing: '', transport: 'odata', windows: false, com: false };
+  var SRC = { list: [], editing: '', transport: 'odata' };
   var TR_HINT = {
     odata: 'Публикация OData в 1С (или общий HTTP-сервис …/hs/odata). Самый простой способ для веб-панели.',
-    com: 'Прямой запуск платформы 1С через COM: нужен Windows-сервер панели с pywin32 и установленной платформой 8.3.',
     mcp: 'Подключение через python-прокси MCP-сервера 1С: база → расширение mcp.cfe → прокси /mcp → панель.'
   };
+  var TR_NAME = { odata: 'OData', com: 'COM (удалён)', mcp: 'MCP' };
   function srcById(id) { return SRC.list.filter(function (x) { return x.id === id; })[0] || null; }
   function loadSources() {
     if (!(AUTH.user && AUTH.user.admin)) return;
     api('/api/src/list', {}).then(function (res) {
       if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message || 'Нет доступа')); return; }
-      SRC.list = res.items || []; SRC.windows = !!res.windows; SRC.com = !!res.com;
+      SRC.list = res.items || [];
       renderSrcTable();
     });
   }
   function srcSummary(x) {
     var p = x.params || {};
     if (x.transport === 'odata') return p.base || '—';
-    if (x.transport === 'com') return (p.connect || '—') + (p.module ? ' · ' + p.module + '.' + (p.method || '') : '');
     return (p.proxy_url || '—') + (p.tool_data ? ' · ' + p.tool_data : '');
   }
   function renderSrcTable() {
@@ -17536,9 +17069,9 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       (SRC.list.length ? SRC.list.map(function (x) {
         var lc = x.last_check || {}, p = x.params || {};
         return '<tr><td class="l"><b>' + esc(x.name) + '</b></td>' +
-          '<td>' + ({ odata: 'OData', com: 'COM', mcp: 'MCP' })[x.transport] + '</td>' +
+          '<td>' + (TR_NAME[x.transport] || x.transport) + '</td>' +
           '<td class="l">' + esc(srcSummary(x)).slice(0, 160) + '</td>' +
-          '<td>' + ((p.login || p.user) ? esc(p.login || p.user) : (x.transport === 'mcp' ? (p.auth === 'bearer' ? 'Bearer' : 'без авторизации') : 'анонимно')) +
+          '<td>' + (esc(p.login || '') || (x.transport === 'mcp' ? (p.auth === 'bearer' ? 'Bearer' : 'без авторизации') : 'анонимно')) +
             (x.has_password ? ' <span class="pill ok">секрет задан</span>' : '') + '</td>' +
           '<td>' + (x.enabled ? '<span class="pill ok">включён</span>' : '<span class="pill warn">выключен</span>') +
             (lc.checked_at ? '<br><span class="muted">' + (lc.ok ? '✓ ' : '✕ ') + esc((lc.checked_at || '').replace('T', ' ')) + '</span>' : '') + '</td>' +
@@ -17546,7 +17079,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
           '<button class="btn sm" data-srcfields="' + esc(x.id) + '">Поля</button> ' +
           '<button class="btn sm" data-srcrows="' + esc(x.id) + '">Строки</button> ' +
           '<button class="btn sm" data-srcedit="' + esc(x.id) + '">Изменить</button></td></tr>';
-      }).join('') : '<tr><td colspan="6" class="empty">Источников пока нет — нажмите «+ Источник». Старые подключения OData/COM перенесены сюда автоматически.</td></tr>') + '</tbody>';
+      }).join('') : '<tr><td colspan="6" class="empty">Источников пока нет — нажмите «+ Источник». Старые подключения перенесены сюда автоматически.</td></tr>') + '</tbody>';
   }
   $('srcAdd').onclick = function () { openSourceModal(null); };
   $('srcTable').onclick = function (e) {
@@ -17564,10 +17097,8 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     Array.prototype.forEach.call(document.querySelectorAll('#srcm .tr-block'), function (blk) {
       blk.hidden = blk.dataset.for !== t; });
     $('srcmTrHint').textContent = TR_HINT[t] || '';
-    if (t === 'com' && !SRC.windows) $('srcmTrHint').textContent += ' · COM доступен только на Windows-сервере панели с pywin32';
     var pwHint = SRC.editing && (srcById(SRC.editing) || {}).has_password ? 'секрет сохранён — оставьте пустым, чтобы не менять' : '';
     $('srcmPassHint').textContent = t === 'odata' ? pwHint : '';
-    $('srcmCpassHint').textContent = t === 'com' ? pwHint : '';
     $('srcmTokenHint').textContent = t === 'mcp' ? pwHint : '';
   }
   $('srcmTransport').onclick = function (e) { var b = e.target.closest('[data-tr]'); if (b) srcTransportSet(b.dataset.tr); };
@@ -17579,10 +17110,6 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     $('srcmBase').value = p.base || ''; $('srcmEntity').value = p.entity || ''; $('srcmTop').value = p.top || 50;
     $('srcmLogin').value = p.login || ''; $('srcmPass').value = '';
     $('srcmFilter').value = p.filter || ''; $('srcmOrderby').value = p.orderby || ''; $('srcmIgnoreCert').checked = !!p.ignore_cert;
-    // com
-    $('srcmConnect').value = p.connect || ''; $('srcmServer').value = p.server || ''; $('srcmCbase').value = p.base || '';
-    $('srcmUser').value = p.user || ''; $('srcmCpass').value = '';
-    $('srcmModule').value = p.module || ''; $('srcmMethod').value = p.method || ''; $('srcmParam').value = p.param || ''; $('srcmDesc').value = p.desc || '';
     // mcp
     $('srcmProxy').value = p.proxy_url || ''; $('srcmAuth').value = p.auth || 'none'; $('srcmToken').value = '';
     $('srcmToolMeta').value = p.tool_meta || 'get_metadata_structure'; $('srcmToolData').value = p.tool_data || '';
@@ -17592,17 +17119,16 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     $('srcmTitle').textContent = x ? 'Источник: ' + x.name : 'Новый источник данных 1С';
     $('srcmSub').textContent = x ? ('id ' + x.id) : '';
     $('srcmDelete').style.display = x ? '' : 'none'; $('srcmDelete').dataset.confirm = ''; $('srcmDelete').textContent = 'Удалить источник';
-    srcTransportSet(x ? x.transport : 'odata');
-    warnIn('srcmWarn', ''); openModal('srcm');
+    srcTransportSet(x && x.transport !== 'com' ? x.transport : 'odata');
+    if (x && x.transport === 'com') warnIn('srcmWarn', 'err', 'Транспорт прямого COM удалён из панели (работал только на Windows). Сохранение переключит источник на выбранный транспорт (OData/MCP) с новыми параметрами.');
+    else warnIn('srcmWarn', '');
+    openModal('srcm');
   }
   function srcFormData() {
     var t = SRC.transport, params = {};
     if (t === 'odata') params = { base: $('srcmBase').value.trim(), entity: $('srcmEntity').value.trim(), top: +$('srcmTop').value || 50,
       login: $('srcmLogin').value.trim(), password: $('srcmPass').value, filter: $('srcmFilter').value.trim(),
       orderby: $('srcmOrderby').value.trim(), ignore_cert: $('srcmIgnoreCert').checked };
-    else if (t === 'com') params = { connect: $('srcmConnect').value.trim(), server: $('srcmServer').value.trim(), base: $('srcmCbase').value.trim(),
-      user: $('srcmUser').value.trim(), password: $('srcmCpass').value, module: $('srcmModule').value.trim(), method: $('srcmMethod').value.trim(),
-      param: $('srcmParam').value, desc: $('srcmDesc').value.trim() };
     else params = { proxy_url: $('srcmProxy').value.trim(), auth: $('srcmAuth').value, password: $('srcmToken').value,
       tool_meta: $('srcmToolMeta').value.trim(), tool_data: $('srcmToolData').value.trim(), metadata_object: $('srcmMetaObj').value.trim(),
       args_template: $('srcmArgs').value.trim(), watermark_field: $('srcmWm').value.trim() };
@@ -17725,7 +17251,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     $('mapmTitle').textContent = m ? 'Сопоставление: ' + m.name : 'Новое сопоставление реквизитов';
     $('mapmName').value = m ? m.name : '';
     $('mapmSource').innerHTML = '<option value="">— выберите источник —</option>' +
-      SYNC.sources.map(function (x) { return '<option value="' + esc(x.id) + '"' + (m && m.source === x.id ? ' selected' : '') + '>' + esc(x.name) + ' · ' + ({ odata: 'OData', com: 'COM', mcp: 'MCP' })[x.transport] + '</option>'; }).join('');
+      SYNC.sources.map(function (x) { return '<option value="' + esc(x.id) + '"' + (m && m.source === x.id ? ' selected' : '') + '>' + esc(x.name) + ' · ' + (TR_NAME[x.transport] || x.transport) + '</option>'; }).join('');
     var ys = yearsList();
     $('mapmYear').innerHTML = ys.map(function (y) { return '<option' + (String(y.year) === String(m && m.year) ? ' selected' : '') + '>' + y.year + '</option>'; }).join('');
     $('mapmMode').value = m && m.mode === 'auto' ? 'auto' : 'manual';

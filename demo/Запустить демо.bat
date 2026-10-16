@@ -32,12 +32,6 @@ if errorlevel 1 (
     exit /b
   )
 )
-rem pywin32 нужен только для прямого COM-подключения к 1С; без него демо работает, а раздел 1С покажет подсказку
-%PY% -c "import pythoncom" 2>nul
-if errorlevel 1 (
-  echo Ставлю pywin32 для прямого подключения к 1С ^(необязательно^)...
-  %PY% -m pip install --user pywin32 2>nul
-)
 %PY% -X utf8 start_demo.py
 echo.
 echo Панель остановлена. Если выше есть ошибка - скопируйте её текст.
