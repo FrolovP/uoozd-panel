@@ -179,7 +179,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 # Сотрудники ОПАиЗ (ответственные в реестре ОПАиЗ).
 СОТРУДНИКИ_ОПАИЗ = ['Недорослева Н.П.', 'Митрофанова М.Э.', 'Небогина О.Ю.', 'Григорьева М.Г.', 'Казначеева Е.Н.',
                     'Сальникова Е.А.']
-# Комиссию и списки сотрудников администратор может менять в панели (Настройки → Справочники);
+# Комиссию и списки сотрудников администратор может менять в панели (Администрирование → Справочники);
 # тогда они хранятся в «Панель — справочники.json» и значения выше — только начальные.
 ФАЙЛ_СПРАВОЧНИКОВ = 'Панель — справочники.json'
 # Подключения к базам 1С по OData (Администрирование → «Базы 1С (OData)»).
@@ -11824,7 +11824,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <div class="body">
       <div class="oz-lists" id="ozListsBox"></div>
       <div class="f" style="margin-top:14px"><label for="ozInitDepts">Инициатор = подразделение <span class="muted">(подставляется при выборе инициатора)</span></label><textarea id="ozInitDepts" rows="6" placeholder="Иванов И.И. = Лаборатория № 1"></textarea></div>
-      <div class="sheet-foot" style="padding:12px 0 0"><span class="muted">Сотрудники ОПАиЗ и ОАО — во вкладке «Настройки» → «Справочники»</span><span class="grow"></span><button class="btn primary" id="ozListsSave">Сохранить справочники</button></div>
+      <div class="sheet-foot" style="padding:12px 0 0"><span class="muted">Сотрудники ОПАиЗ и ОАО — во вкладке «Администрирование» → «Справочники»</span><span class="grow"></span><button class="btn primary" id="ozListsSave">Сохранить справочники</button></div>
     </div>
   </section>
 </div>
@@ -13413,7 +13413,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     if (v === 'an') renderAnalytics();
     if (v === 'rep') renderReports();
     if (v === 'sup') loadSuppliers(true).then(renderSuppliers);
-    if (v === 'users') { loadUsers(); loadDirs(); loadOdata(); loadC1(); }
+    if (v === 'users') { loadUsers(); loadDirs(); setAdmTab(restore('reestr-adm-tab') || 'users'); }
     if (v === 'opaiz') renderOz();
     if (v === 'ovrk') renderOvrk();
     if (v === 'plan' || v === 'planDept') renderPlan();
@@ -17025,7 +17025,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   function canSeeDept(d) { var u = AUTH.user; return !u || u.admin || d === 'ОАО' || d === 'УЗ' || d === 'ИНИЦ' || u.dept === d; }
   function renderDepts() {
     var u = AUTH.user, list = DEPTS.filter(function (d) { return canSeeDept(d[0]); });
-    if (u && u.admin) list = list.concat([['users', 'Настройки']]);
+    if (u && u.admin) list = list.concat([['users', 'Администрирование']]);
     if (!list.some(function (d) { return d[0] === state.dept; })) state.dept = 'ОАО';
     $('deptTabs').innerHTML = list.map(function (d) { return '<button type="button" data-dept="' + d[0] + '" title="' + esc(DEPT_FULL[d[0]] || '') + '" aria-selected="' + (d[0] === state.dept) + '">' + esc(d[1]) + '</button>'; }).join('');
   }
