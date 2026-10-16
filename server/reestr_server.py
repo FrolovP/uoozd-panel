@@ -2372,6 +2372,7 @@ def src_save(data, actor):
         if not any(x.get('id') == sid for x in rows):
             rows.append(rec)
         src_save_raw(rows)
+        mcp_reset(sid)   # параметры могли измениться — при следующем обращении повторим initialize
         log('edit', f"Источники 1С: «{name}» ({rec['transport']}) сохранён", user=(actor or {}).get('fio') or 'панель')
         return src_public(rec)
 
@@ -2386,6 +2387,7 @@ def src_delete(sid, actor):
         if used:
             raise ValueError(f"Источник используется сопоставлениями: {', '.join(used[:5])} — сначала измените их")
         src_save_raw([x for x in rows if x.get('id') != sid])
+        mcp_reset(sid)
         log('edit', f"Источники 1С: удалён «{hit.get('name')}»", user=(actor or {}).get('fio') or 'панель')
 
 
@@ -2398,7 +2400,35 @@ def src_save_last_check(sid, check):
         src_save_raw(rows)
 
 
-# --- MCP-транспорт: JSON-RPC вызовы к python-прокси (tools/list, tools/call) ---
+# --- MCP-транспорт: JSON-RPC вызовы к python-прокси (initialize, tools/list, tools/call) ---
+MCP_HANDSHAKE = {}    # id источника → True после успешного initialize на этом запуске сервера
+
+
+def mcp_ensure_init(rec):
+    """Handshake MCP: прокси по стандарту требует initialize перед другими методами.
+    Отправляем initialize + notifications/initialized один раз на источник за запуск
+    сервера; при неудаче — не кэшируем, следующая попытка повторит."""
+    sid = str(rec.get('id') or '')
+    if MCP_HANDSHAKE.get(sid):
+        return
+    mcp_rpc(rec, 'initialize', {
+        'protocolVersion': '2025-03-26',
+        'capabilities': {},
+        'clientInfo': {'name': 'Panel UOOZD', 'version': '14'}}, timeout=20)
+    try:   # notifications/initialized — ответ не ожидается (204), ошибка не фатальна
+        mcp_rpc(rec, 'notifications/initialized', None, timeout=10)
+    except ValueError:
+        pass
+    MCP_HANDSHAKE[sid] = True
+
+
+def mcp_reset(rec_or_id):
+    """Сброс handshake (источник изменён/удалён или прокси перезапускали)."""
+    sid = rec_or_id if isinstance(rec_or_id, str) else str((rec_or_id or {}).get('id') or '')
+    MCP_HANDSHAKE.pop(sid, None)
+
+
+
 
 def mcp_rpc(rec, method, params=None, timeout=None):
     """Один JSON-RPC 2.0 запрос к MCP-прокси. → result или ValueError с текстом ошибки."""
@@ -2442,7 +2472,17 @@ def mcp_tool_call(rec, tool, args=None, timeout=None):
     """tools/call → текст ответа инструмента MCP (из content[].text)."""
     if not str(tool or '').strip():
         raise ValueError('У источника MCP не задан имя инструмента')
-    res = mcp_rpc(rec, 'tools/call', {'name': tool, 'arguments': args or {}}, timeout=timeout) or {}
+    mcp_ensure_init(rec)
+    try:
+        res = mcp_rpc(rec, 'tools/call', {'name': tool, 'arguments': args or {}}, timeout=timeout) or {}
+    except ValueError as e:
+        msg = str(e).lower()
+        if 'init' in msg or 'session' in msg:   # прокси перезапустили — одна повторная попытка с новым handshake
+            mcp_reset(rec)
+            mcp_ensure_init(rec)
+            res = mcp_rpc(rec, 'tools/call', {'name': tool, 'arguments': args or {}}, timeout=timeout) or {}
+        else:
+            raise
     if res.get('isError'):
         txt = '; '.join(c.get('text', '') for c in res.get('content') or [] if c.get('type') == 'text')
         raise ValueError(f'Инструмент MCP «{tool}» вернул ошибку: {txt[:300]}')
@@ -2614,6 +2654,7 @@ def src_check(rec, actor):
             r = c1_conn_check(form, actor)
             r['checked_at'] = checked_at
             return r
+        mcp_ensure_init(rec)
         info = mcp_rpc(rec, 'tools/list', {}, timeout=20) or {}
         names = [x.get('name') for x in info.get('tools') or []]
         need = [n for n in (p.get('tool_meta'), p.get('tool_data')) if n and n not in names]
@@ -2655,6 +2696,7 @@ def src_api(path, data, user):
                      min(int(data.get('top') or ODATA_PAGE), ODATA_MAX_ROWS), int(data.get('skip') or 0))
         return {'ok': True, **q}
     if path == '/api/src/mcp_tools':
+        mcp_ensure_init(rec)
         info = mcp_rpc(rec, 'tools/list', {}, timeout=20) or {}
         return {'ok': True, 'tools': [{'name': x.get('name'), 'description': (x.get('description') or '')[:200]}
                                       for x in info.get('tools') or []]}
@@ -11846,6 +11888,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <span class="grow"></span>
     <span class="seg yswitch" id="ovYear" role="group" aria-label="Год договора"></span>
     <span class="muted oz-sync" id="ovSync"></span>
+    <button type="button" class="btn" id="ovRescan" title="Заново просканировать папку платёжек">⟳ Пересканировать папку</button>
   </div>
 
   <!-- Мой день / День отдела -->
