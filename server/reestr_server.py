@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
@@ -178,7 +179,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 # Сотрудники ОПАиЗ (ответственные в реестре ОПАиЗ).
 СОТРУДНИКИ_ОПАИЗ = ['Недорослева Н.П.', 'Митрофанова М.Э.', 'Небогина О.Ю.', 'Григорьева М.Г.', 'Казначеева Е.Н.',
                     'Сальникова Е.А.']
-# Комиссию и списки сотрудников администратор может менять в панели (Настройки → Справочники);
+# Комиссию и списки сотрудников администратор может менять в панели (Администрирование → Справочники);
 # тогда они хранятся в «Панель — справочники.json» и значения выше — только начальные.
 ФАЙЛ_СПРАВОЧНИКОВ = 'Панель — справочники.json'
 # Подключения к базам 1С по OData (Администрирование → «Базы 1С (OData)»).
@@ -186,6 +187,16 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 ODATA_TIMEOUT = 20          # секунд на HTTP-запрос к 1С
 ODATA_PAGE = 50             # страница $top по умолчанию
 ODATA_MAX_ROWS = 5000       # максимум строк за один просмотр таблицы
+
+# Синхронизация сопоставленных данных из баз 1С (Администрирование → Настройка источников):
+ФАЙЛ_МАППИНГИ = 'Панель — сопоставления 1С.json'    # настройки сопоставления реквизитов
+ФАЙЛ_СИНХРО = 'Панель — синхронизация 1С.json'      # журнал прогонов (последние 300)
+ФАЙЛ_СИНХРО_НАСТР = 'Панель — синхронизация 1С — расписание.json'  # расписание авто-синхронизации
+ФАЙЛ_ИСТОЧНИКИ = 'Панель — источники 1С.json'       # единый список источников (OData / COM / MCP)
+ФАЙЛ_КЛЮЧИ_1С = 'Реестр — ключи 1С.json'            # GUID строки реестра → номер закупки
+СИНХРО_МАКС_СТРОК = 2000                            # максимум строк за прогон по одному сопоставлению
+СИНХРО_ПАУЗА = 3                                    # секунд между запросами к 1С внутри прогона
+SOURCES_LOCK = threading.Lock()                     # одна синхронизация с 1С одновременно
 
 # Планировщик: через сколько дней после итогов договор считать «затянувшимся».
 ДОГОВОР_ЖДЁМ_ДНЕЙ = 20
@@ -1772,85 +1783,24 @@ def odata_api(path, data, user):
 
 
 # =====================================================================
-# БАЗЫ 1С БЕЗ ВЕБ-ПУБЛИКАЦИИ — прямое COM-соединение (V83.COMConnector)
-# Второй вариант подключения для баз, которые не опубликованы как OData:
-# панель (Windows-сервер с установленной платформой 1С той же разрядности,
-# что и Python) открывает соединение по строке вида
-#   File="C:\Базы\Закупки";Usr="Имя";Pwd="пароль";           — файловая база
-#   Srvr="srv1c:1541";Ref="Закупки";Usr="Имя";Pwd="пароль";  — клиент-серверная
-# и вызывает общий модуль 1С через COM. Требует pywin32 (pythoncom) на машине
-# панели; на Linux/Mac раздел показывает подсказку и позволяет завести/проверить
-# параметры подключения.
-# Хранение: «Панель — подключения 1С прямые.json». Пароль доступа хранится
-# рядом с панелью — доступ к файлу должен быть только у сервера.
+# ПОДДЕРЖКА ПРЯМОГО COM-СОЕДИНЕНИЯ С 1С УДАЛЕНА
+# Транспорт V83.COMConnector (pywin32) работал только на Windows и не мог
+# работать на Linux/macOS. Вместо него для баз без веб-публикации
+# используется MCP-транспорт (python-прокси src/py_server + расширение
+# mcp.cfe в базе 1С) либо публикация OData.
+# Старые файлы «Панель — подключения 1С прямые.json» при первом запуске
+# мигрируются в единый список источников; записи с transport='com'
+# помечаются выключенными с пояснением (см. src_migrate_once).
+# Ниже оставлены только pure-python утилиты маскировки секретов в старых
+# строках соединения (Pwd="…") — они нужны для журнала и списка источников.
 # =====================================================================
 
-ФАЙЛ_1С_ПРЯМЫЕ = 'Панель — подключения 1С прямые.json'
-COM_TIMEOUT = 60                 # секунд на вызов общего модуля 1С
-_1c_lock = threading.Lock()
+ФАЙЛ_1С_ПРЯМЫЕ = 'Панель — подключения 1С прямые.json'   # только для миграции старых подключений
 
 
-def c1_load_raw():
-    rows = _json_file(ФАЙЛ_1С_ПРЯМЫЕ, [])
-    return rows if isinstance(rows, list) else []
-
-
-def c1_save_raw(rows):
-    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_1С_ПРЯМЫЕ, json.dumps(rows, ensure_ascii=False, indent=1))
-
-
-def c1_public(rec):
-    """Для браузера: без пароля доступа, с признаком «пароль задан» и строкой соединения без секрета."""
-    out = {k: rec.get(k) for k in ('id', 'name', 'base', 'server', 'user', 'desc', 'module', 'method', 'param',
-                                   'enabled', 'created_at', 'updated_at', 'last_check')}
-    out['connect'] = c1_hide_secret(rec.get('connect'))
-    out['has_password'] = bool(rec.get('password')) or bool(c1_split_password(rec.get('connect')))
-    return out
-
-
-def c1_form_data(rec):
-    """Что подставить в форму при повторной проверке/вызове (без Pwd из строки)."""
-    d = c1_public(rec)
-    connect = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', str(rec.get('connect') or ''), flags=re.IGNORECASE)
-    d['connect'] = connect
-    d['password'] = str(rec.get('password') or '') or c1_split_password(str(rec.get('connect') or ''))
-    return d
-
-
-def c1_norm_connect(s):
-    """Строка соединения V83.COMConnector → нормализованный вид с кавычками и «;» в конце.
-
-    Реальный формат COM-соединителя 1С:
-      файловая база        File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль";
-      клиент-серверная     Srvr="srv1c:1541";Ref="ИмяБазы";Usr="Имя";Pwd="пароль";
-    Значения принимаются в кавычках и без; параметры пересобираются в канонический вид."""
-    t = str(s or '').strip().rstrip(';').strip()
-    if not t:
-        raise ValueError('Не указана строка соединения с базой 1С')
-    pairs = []
-    pos = 0
-    for m in re.finditer(r'(\w+)\s*=\s*(?:"([^"]*)"|([^;]*))', t):
-        if t[pos:m.start()].strip(' ;'):
-            raise ValueError('Строка соединения должна быть вида File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль"; '
-                             'или Srvr="сервер";Ref="имя базы";Usr="Имя";Pwd="пароль";')
-        if m.group(2) is None and ',' in (m.group(3) or ''):
-            raise ValueError('Похоже на строку старого формата с запятыми. COM-соединитель 1С принимает параметры '
-                             'через «;»: File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль";')
-        pairs.append((m.group(1), m.group(2) if m.group(2) is not None else (m.group(3) or '').strip()))
-        pos = m.end()
-    if t[pos:].strip(' ;') or not pairs:
-        raise ValueError('Строка соединения должна быть вида File="C:\\Базы\\Закупки";Usr="Имя";Pwd="пароль"; '
-                         'или Srvr="сервер";Ref="имя базы";Usr="Имя";Pwd="пароль";')
-    keys = [k.lower() for k, _ in pairs]
-    if len(set(keys)) != len(keys):
-        raise ValueError('В строке соединения параметр указан дважды')
-    if 'file' in keys:
-        pass
-    elif 'srvr' in keys and 'ref' in keys:
-        pass
-    else:
-        raise ValueError('Укажите File="путь к каталогу базы" (файловая база) или Srvr="сервер";Ref="имя базы" (клиент-серверная)')
-    return ';'.join(f'{k}="{v}"' for k, v in pairs) + ';'
+def c1_hide_secret(connect):
+    """Строка соединения без секрета (Pwd="••••") — для сообщений об ошибках и журнала."""
+    return re.sub(r'(Pwd\s*=\s*")[^"]*(")', r'\1••••\2', str(connect or ''), flags=re.IGNORECASE)
 
 
 def c1_split_password(connect):
@@ -1859,366 +1809,850 @@ def c1_split_password(connect):
     return m.group(1) if m else ''
 
 
-def c1_is_windows():
-    return os.name == 'nt'
+# =====================================================================
+# ЕДИНЫЕ ИСТОЧНИКИ 1С (Администрирование → Настройка источников)
+# Список из N источников с индивидуальными параметрами; транспорты:
+#   odata — публикация OData (параметры как у старых подключений),
+#   mcp   — Python-прокси MCP-сервера 1С (JSON-RPC tools/call на http://…/mcp).
+# Транспорт 'com' (прямой V83.COMConnector) удалён — панель кроссплатформенна
+# (Windows/Linux/macOS); старые COM-подключения при миграции сохраняются в
+# списке выключенными только ради истории параметров.
+# Хранение: «Панель — источники 1С.json». Запись:
+#   {"id","name","transport","params":{…},"enabled","created_at","updated_at","last_check"}
+# Старые файлы подключений при первом запуске мигрируются сюда автоматически.
+# Единый слой доступа: src_fields(rec) → [{'name','label'}],
+#                     src_rows(rec, filt, orderby, top, skip, watermark) → {'columns','rows','total'}.
+# =====================================================================
+
+SRC_TRANSPORTS = ('odata', 'mcp')
+LEGACY_TRANSPORTS = ('com',)   # унаследованные записи (только просмотр; обращения запрещены)
+LEGACY_TRANSPORTS = ('com',)   # унаследованные записи в списке источников (только просмотр, обращения запрещены)
 
 
-def c1_com_available():
-    """Есть ли на машине панели pythoncom (pywin32) — прямой запуск 1С возможен только с ним."""
-    try:
-        import pythoncom  # noqa: F401
-        return True
-    except ImportError:
-        return False
+def src_load_raw():
+    rows = _json_file(ФАЙЛ_ИСТОЧНИКИ, [])
+    return rows if isinstance(rows, list) else []
 
 
-def _com_error_text(e):
-    """Из COM-ошибки pywin32 достаём максимально информативный текст.
-
-    pywintypes.com_error: args = (HRESULT, описание, (источник, описание, файл
-    справки, контекст, код), HRESULT2) — настоящий текст ошибки 1С обычно
-    в excepinfo, а не в первых двух аргументах (там лишь «Ошибка.»)."""
-    parts = []
-    for arg in getattr(e, 'args', ()):
-        if isinstance(arg, tuple):
-            parts.extend(str(x) for x in arg if x and str(x) not in ('None',))
-        elif arg not in (None, ''):
-            parts.append(str(arg))
-    excep = getattr(e, 'excepinfo', None)
-    if excep:
-        parts.extend(str(x) for x in excep if x and str(x) not in ('None',))
-    seen, out = set(), []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return ' | '.join(out) or str(e)
+def src_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ИСТОЧНИКИ, json.dumps(rows, ensure_ascii=False, indent=1))
 
 
-def c1_open_connection(connect, timeout=COM_TIMEOUT):
-    """Открывает EnterpriseConnector (COM) к базе 1С без веб-публикации.
-
-    Возвращает объект соединения; ошибки превращает в понятный текст.
-    Вызывается из потока HTTP-сервера: COM в потоке инициализируется здесь
-    (CoInitialize), а освобождается вызывающим кодом — pythoncom.CoUninitialize()
-    после закрытия соединения."""
-    try:
-        import win32com.client
-        import pythoncom
-    except ImportError as e:
-        raise ValueError('На компьютере панели не установлен pywin32 — прямой запуск 1С невозможен. '
-                         'Установите: pip install pywin32 (нужна Windows с установленной платформой 1С)') from e
-    connect = c1_norm_connect(connect)
-    pythoncom.CoInitialize()  # COM обязателен к инициализации в каждом потоке — сервер многопоточный
-    try:
-        coord = win32com.client.Dispatch('V83.COMConnector', clsctx=pythoncom.CLSCTX_LOCAL_SERVER)
-        conn = coord.Connect(connect)
-    except Exception as e:
-        try:
-            pythoncom.CoUninitialize()  # соединение не открылось — освобождаем COM в этом потоке
-        except Exception:
-            pass
-        text = _com_error_text(e)
-        low = text.lower()
-        if 'класс не зарегистрирован' in low or 'invalid class string' in low or '-2147221164' in low:
-            raise ValueError('Платформа 1С не установлена на этом компьютере: COM-класс V83.COMConnector не '
-                             'зарегистрирован. Установите платформу 1С той же разрядности, что и Python панели '
-                             '(достаточно компонента «COM-соединение» из дистрибутива платформы)') from e
-        if 'несоответствие версий' in low or 'различаются версии' in low:
-            raise ValueError(f'Несоответствие версий платформы 1С: {text[:250]}. На компьютере панели должна быть '
-                             f'зарегистрирована comcntr.dll той же версии платформы, что на сервере '
-                             f'(regsvr32 …\\1cv8\\<версия>\\bin\\comcntr.dll)') from e
-        if 'не найдена' in low or 'not found' in low or '-2147' in low and 'база' in low:
-            raise ValueError(f'База 1С не найдена по строке «{c1_hide_secret(connect)}» — проверьте путь и имя базы') from e
-        if 'логин' in low or 'пользовател' in low or 'login' in low:
-            raise ValueError(f'1С отклонила пользователя «{text}»'.rstrip('» ') + ' — проверьте имя пользователя и пароль') from e
-        if 'лиценз' in low or 'license' in low:
-            raise ValueError('1С отказала: нет лицензии на подключение через COM — проверьте лицензию технологического сервера') from e
-        raise ValueError(f'1С не ответила на прямое подключение: {text[:300]}') from e
-    if conn is None:
-        raise ValueError('1С вернула пустое соединение — база открыта в монопольном режиме или недоступна')
-    return conn
+def src_migrate_once():
+    """Перенос старых подключений OData/COM в единый список источников (однократно)."""
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        if rows or (ПАПКА_ПАНЕЛИ / ФАЙЛ_ИСТОЧНИКИ).exists():
+            return
+        moved = []
+        for x in odata_load_raw():
+            p = {k: x.get(k) for k in ('base', 'entity', 'login', 'password', 'filter', 'orderby', 'top', 'ignore_cert')}
+            moved.append({'id': f"od-{x.get('id')}", 'name': x.get('name'), 'transport': 'odata',
+                          'params': p, 'enabled': bool(x.get('enabled', True)),
+                          'created_at': x.get('created_at'), 'updated_at': x.get('updated_at'),
+                          'last_check': x.get('last_check')})
+        for x in _json_file(ФАЙЛ_1С_ПРЯМЫЕ, []) or []:
+            if not isinstance(x, dict):
+                continue
+            p = {k: x.get(k) for k in ('connect', 'base', 'server', 'user', 'password', 'desc', 'module', 'method', 'param')}
+            # COM-транспорт удалён (работал только на Windows) — переносим выключенными ради истории параметров
+            moved.append({'id': f"c1-{x.get('id')}", 'name': x.get('name'), 'transport': 'com',
+                          'params': p, 'enabled': False,
+                          'created_at': x.get('created_at'), 'updated_at': x.get('updated_at'),
+                          'last_check': {'ok': False, 'checked_at': datetime.now().isoformat(timespec='seconds'),
+                                         'message': 'COM-транспорт удалён — панель кроссплатформенна (Windows/Linux/macOS). '
+                                                    'Пересоздайте источник на OData или MCP'}})
+        if not moved:
+            return
+        src_save_raw(moved)
+        # старые файлы больше не используются — оставляем резервные копии
+        for f in (ФАЙЛ_ОДATA, ФАЙЛ_1С_ПРЯМЫЕ):
+            try:
+                old = ПАПКА_ПАНЕЛИ / f
+                if old.exists():
+                    old.rename(old.with_name(old.name + '.bak'))
+            except OSError:
+                pass
+        log('info', f'Источники 1С: перенесено старых подключений — {len(moved)}')
 
 
-def c1_hide_secret(connect):
-    """Строка соединения без секрета (Pwd="••••") — для сообщений об ошибках и журнала."""
-    return re.sub(r'(Pwd\s*=\s*")[^"]*(")', r'\1••••\2', str(connect or ''), flags=re.IGNORECASE)
-
-
-def c1_call(conn, module, method, param):
-    """Вызов общего модуля 1С через COM: conn.<Модуль>.<Метод>(param) → ответ.
-
-    Общий модуль — свойство объекта соединения (не функция): вызывать сам объект
-    модуля нельзя, метод берётся прямо с него. Чтобы модуль был доступен через
-    внешнее соединение, в конфигураторе у него должны стоять флаги «Сервер» и
-    «Внешнее соединение», а у процедуры/функции — признак «Экспорт»."""
-    mod = str(module or '').strip()
-    met = str(method or '').strip()
-    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*', mod):
-        raise ValueError('Имя общего модуля 1С может состоять только из букв, цифр и подчёркивания')
-    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё_][A-Za-zА-Яа-яЁё0-9_]*', met):
-        raise ValueError('Имя процедуры/функции 1С может состоять только из букв, цифр и подчёркивания')
-    try:
-        obj = getattr(conn, mod)
-    except AttributeError as e:
-        raise ValueError(f'Общий модуль «{mod}» в конфигурации 1С не найден или недоступен через внешнее соединение — '
-                         f'проверьте имя модуля и его флаги «Сервер»/«Внешнее соединение»') from e
-    try:
-        fn = getattr(obj, met)
-    except Exception as e:
-        raise ValueError(f'Модуль «{mod}» доступен, но экспортной процедуры/функции «{met}» в нём нет: {str(e)[:200]}') from e
-    try:
-        res = fn(param) if str(param or '') != '' else fn()
-    except Exception as e:
-        raise ValueError(f'1С выполнила «{mod}.{met}» с ошибкой: {str(e)[:300]}') from e
-    return res
-
-
-def c1_result_to_jsonable(v):
-    """Ответ 1С (строка/число/булево/ТаблицаЗначений/Массив) → обычный Python для JSON."""
-    if v is None or isinstance(v, (str, int, float, bool)):
-        return v
-    s = str(v)
-    if s.startswith('{') or s.startswith('['):
-        try:
-            return json.loads(s)
-        except ValueError:
-            pass
-    return s
-
-
-def c1_assemble(data):
-    """Собрать строку соединения V83.COMConnector из полей формы.
-
-    Готовая строка в поле connect имеет приоритет. Иначе: «сервер + имя базы»
-    → Srvr="сервер";Ref="база"; (клиент-серверная), только «путь к базе»
-    → File="путь"; (файловая). Пользователь и пароль добавляются параметрами
-    Usr="/Pwd=" — если их ещё нет в строке."""
-    connect = str(data.get('connect') or '').strip()
-    base = str(data.get('base') or '').strip().strip('"')
-    server = str(data.get('server') or '').strip().strip('"')
-    user = str(data.get('user') or '').strip().strip('"')
-    password = str(data.get('password') or '')
-    if not connect and base:
-        if server:
-            connect = f'Srvr="{server}";Ref="{base}";'
-        else:
-            connect = f'File="{base}";'
-    if connect:
-        low = connect.lower()
-        if user and not re.search(r'\busr\s*=', low):
-            connect = connect.rstrip(';').rstrip() + f';Usr="{user}";'
-        if password and not re.search(r'\bpwd\s*=', low):
-            connect = connect.rstrip(';').rstrip() + f';Pwd="{password}";'
-    return connect
-
-
-def c1_conn_check(data, actor):
-    """Проверка прямого подключения по данным формы → {'ok','message','checked_at'}."""
-    checked_at = datetime.now().isoformat(timespec='seconds')
-    res = {'ok': False, 'message': '', 'checked_at': checked_at}
-    data = dict(data or {})
-    old = c1_find(str(data.get('id') or '')) if data.get('id') else None
-    # если пароль не вводили — берём сохранённый из записи (или из сохранённой строки)
-    if not str(data.get('password') or ''):
-        if old:
-            saved_pw = str(old.get('password') or '') or c1_split_password(str(old.get('connect') or ''))
-            if saved_pw and 'Pwd=' not in str(data.get('connect') or ''):
-                data['password'] = saved_pw
-    connect = c1_assemble(data)
-    try:
-        connect = c1_norm_connect(connect)
-    except ValueError as e:
-        res['message'] = str(e)
-        return res
-    if not c1_is_windows():
-        res['message'] = ('Строка соединения корректна. Сама проверка прямым запуском выполняется только на Windows-'
-                          'сервере с установленной платформой 1С — на этом компьютере панель работает без COM 1С, '
-                          'используйте подключения OData')
-        return res
-    if not c1_com_available():
-        res['message'] = 'На компьютере панели не установлен pywin32 (pip install pywin32) — прямой запуск 1С недоступен'
-        return res
-    try:
-        conn = c1_open_connection(connect)
-    except ValueError as e:
-        res['message'] = str(e)
-        return res
-    try:
-        note = 'Соединение с базой установлено'
-        mod, met = str(data.get('module') or '').strip(), str(data.get('method') or '').strip()
-        if mod or met:
-            if not (mod and met):
-                res['message'] = note + ' ✓. Для проверки обмена заполните и модуль, и процедуру 1С — или оставьте оба пустыми'
-                res['ok'] = True
-                return res
-            raw = c1_call(conn, mod, met, data.get('param'))
-            val = c1_result_to_jsonable(raw)
-            preview = json.dumps(val, ensure_ascii=False)[:500] if not isinstance(val, str) else val[:500]
-            note += f', ответ 1С «{mod}.{met}»: {preview or "(пусто)"}'
-        res['ok'] = True
-        res['message'] = note
-    except ValueError as e:
-        res['message'] = f'Соединение с базой установлено ✓, но {e}'
-    finally:
-        conn = None  # у COM-соединения 1С нет метода Disconnect — оно закрывается освобождением объекта
-        try:
-            import pythoncom
-            pythoncom.CoUninitialize()
-        except Exception:
-            pass
-    return res
-
-
-def c1_find(conn_id):
-    for x in c1_load_raw():
-        if x.get('id') == conn_id:
+def src_find(src_id):
+    for x in src_load_raw():
+        if x.get('id') == src_id:
             return x
     return None
 
 
-def c1_save_last_check(conn_id, check):
-    with _1c_lock:
-        rows = c1_load_raw()
-        hit = False
-        for x in rows:
-            if x.get('id') == conn_id:
-                x['last_check'] = check
-                hit = True
-        if hit:
-            c1_save_raw(rows)
+def src_public(rec):
+    p = dict(rec.get('params') or {})
+    has_pw = bool(p.get('password'))
+    for k in ('password',):
+        p.pop(k, None)
+    if rec.get('transport') == 'com':
+        p['connect'] = c1_hide_secret(p.get('connect'))
+    return {'id': rec.get('id'), 'name': rec.get('name'), 'transport': rec.get('transport'),
+            'params': p, 'has_password': has_pw, 'enabled': bool(rec.get('enabled', True)),
+            'created_at': rec.get('created_at'), 'updated_at': rec.get('updated_at'),
+            'last_check': rec.get('last_check')}
 
 
-def c1_save_conn(data, actor):
-    """Создание/изменение прямого подключения администратором."""
-    with _1c_lock:
-        rows = c1_load_raw()
-        cid = str(data.get('id') or '').strip()
-        if not cid:
-            cid = re.sub(r'[^a-z0-9_-]', '', str(data.get('name') or 'c1').lower())[:40] or 'c1'
-            base_id, n = cid, 2
-            while any(x.get('id') == cid for x in rows):
-                cid = f'{base_id}-{n}'
-                n += 1
-        old = next((x for x in rows if x.get('id') == cid), None)
+def src_norm(rec):
+    """Проверка и нормализация записи источника по транспорту."""
+    t = str(rec.get('transport') or '').strip().lower()
+    if t in LEGACY_TRANSPORTS:
+        raise ValueError('Прямое COM-подключение к 1С удалено из панели (работало только на Windows). '
+                         'Для баз без веб-публикации используйте MCP-прокси, либо опубликуйте OData в 1С')
+    if t not in SRC_TRANSPORTS:
+        raise ValueError('Неизвестный транспорт источника — выберите OData или MCP')
+    p = dict(rec.get('params') or {})
+    if t == 'odata':
+        p['base'] = odata_norm_url(p.get('base'))
+        p['entity'] = str(p.get('entity') or '').strip()[:120]
+        p['login'] = str(p.get('login') or '').strip()[:120]
+        p['filter'] = str(p.get('filter') or '').strip()[:1000]
+        p['orderby'] = str(p.get('orderby') or '').strip()[:200]
+        p['top'] = max(1, min(int(p.get('top') or ODATA_PAGE), 1000))
+        p['ignore_cert'] = bool(p.get('ignore_cert'))
+    else:  # mcp — python-прокси MCP-сервера 1С
+        u = str(p.get('proxy_url') or '').strip()
+        if not u:
+            raise ValueError('Для транспорта MCP укажите адрес прокси (http://хост:порт/mcp)')
+        parts = urlsplit(u)
+        if parts.scheme not in ('http', 'https') or not parts.netloc:
+            raise ValueError('Адрес MCP-прокси должен начинаться с http:// или https://')
+        p['proxy_url'] = u
+        p['auth'] = str(p.get('auth') or 'none').strip().lower()
+        if p['auth'] not in ('none', 'bearer'):
+            raise ValueError('Доступный способ авторизации MCP — токен (Bearer) или без авторизации')
+        p['tool_list'] = str(p.get('tool_list') or 'list_metadata_objects').strip()[:120]
+        p['tool_meta'] = str(p.get('tool_meta') or 'get_metadata_structure').strip()[:120]
+        p['tool_data'] = str(p.get('tool_data') or '').strip()[:120]
+    rec['transport'] = t
+    rec['params'] = p
+    return rec
+
+
+def src_save(data, actor):
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        sid = str(data.get('id') or '').strip()
+        if not sid:
+            sid = str(uuid.uuid4())[:8]
+        old = next((x for x in rows if x.get('id') == sid), None)
         name = str(data.get('name') or '').strip()
         if not name:
-            raise ValueError('Название подключения обязательно')
-        data = dict(data)
-        if not str(data.get('password') or '') and old:
-            saved_pw = str(old.get('password') or '') or c1_split_password(str(old.get('connect') or ''))
-            if saved_pw:
-                data['password'] = saved_pw
-        connect = c1_norm_connect(c1_assemble(data))
-        pwd = str(data.get('password') or '') or c1_split_password(connect)
-        # секрет храним только в отдельном поле — в сохранённой строке соединения его быть не должно
-        connect = re.sub(r'Pwd\s*=\s*"[^"]*";?', '', connect, flags=re.IGNORECASE)
-        rec = {
-            'id': cid,
-            'name': name[:120],
-            'connect': connect,
-            'base': str(data.get('base') or '').strip()[:120],
-            'server': str(data.get('server') or '').strip()[:120],
-            'user': str(data.get('user') or '').strip()[:120],
-            'password': pwd,
-            'desc': str(data.get('desc') or '').strip()[:300],
-            'module': str(data.get('module') or '').strip()[:120],
-            'method': str(data.get('method') or '').strip()[:120],
-            'param': str(data.get('param') or '')[:2000],
-            'enabled': bool(data.get('enabled', True)),
-            'created_at': (old or {}).get('created_at') or datetime.now().isoformat(timespec='seconds'),
-            'updated_at': datetime.now().isoformat(timespec='seconds'),
-            'last_check': (old or {}).get('last_check'),
-        }
-        if old:
-            rows = [rec if x.get('id') == cid else x for x in rows]
-        else:
+            raise ValueError('Название источника обязательно')
+        params = dict(data.get('params') or {})
+        if not str(params.get('password') or '') and old:
+            params['password'] = str((old.get('params') or {}).get('password') or '')
+        rec = src_norm({'id': sid, 'name': name[:120], 'transport': data.get('transport'), 'params': params,
+                        'enabled': bool(data.get('enabled', True)),
+                        'created_at': (old or {}).get('created_at') or datetime.now().isoformat(timespec='seconds'),
+                        'updated_at': datetime.now().isoformat(timespec='seconds'),
+                        'last_check': (old or {}).get('last_check')})
+        rows = [rec if x.get('id') == sid else x for x in rows]
+        if not any(x.get('id') == sid for x in rows):
             rows.append(rec)
-        c1_save_raw(rows)
-        log('edit', f"1С прямое: подключение «{rec['name']}» ({c1_hide_secret(connect)}) сохранено",
-            user=(actor or {}).get('fio') or 'панель')
-        return c1_public(rec)
+        src_save_raw(rows)
+        mcp_reset(sid)   # параметры могли измениться — при следующем обращении повторим initialize
+        log('edit', f"Источники 1С: «{name}» ({rec['transport']}) сохранён", user=(actor or {}).get('fio') or 'панель')
+        return src_public(rec)
 
 
-def c1_delete_conn(conn_id, actor):
-    with _1c_lock:
-        rows = c1_load_raw()
-        rec = next((x for x in rows if x.get('id') == conn_id), None)
-        if not rec:
-            raise ValueError('Подключение не найдено')
-        c1_save_raw([x for x in rows if x.get('id') != conn_id])
-        log('edit', f"1С прямое: подключение «{rec['name']}» удалено", user=(actor or {}).get('fio') or 'панель')
+def src_delete(sid, actor):
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        hit = next((x for x in rows if x.get('id') == sid), None)
+        if not hit:
+            return
+        used = [m.get('name') for m in map_load() if m.get('source') == sid]
+        if used:
+            raise ValueError(f"Источник используется сопоставлениями: {', '.join(used[:5])} — сначала измените их")
+        src_save_raw([x for x in rows if x.get('id') != sid])
+        mcp_reset(sid)
+        log('edit', f"Источники 1С: удалён «{hit.get('name')}»", user=(actor or {}).get('fio') or 'панель')
 
 
-def c1_api(path, data, user):
-    """Эндпоинты раздела: POST /api/c1/…  (все — только для администратора)."""
-    if not user.get('admin'):
-        raise PermissionError('Раздел «Подключение к 1С» доступен только администратору')
-    if path == '/api/c1/list':
-        return {'ok': True, 'items': [c1_public(x) for x in c1_load_raw()],
-                'windows': c1_is_windows(), 'com': c1_com_available()}
-    if path == '/api/c1/save':
-        return {'ok': True, 'item': c1_save_conn(data, user)}
-    if path == '/api/c1/delete':
-        c1_delete_conn(str(data.get('id') or ''), user)
-        return {'ok': True}
-    if path == '/api/c1/check':
-        check = c1_conn_check(data, user)
-        if data.get('id'):
-            c1_save_last_check(str(data.get('id')), check)
-            log('info' if check['ok'] else 'error',
-                f"1С прямое: проверка «{(c1_find(str(data['id'])) or {}).get('name') or data.get('id')}» — {check['message']}",
-                user=user.get('fio') or 'панель')
-        return {'ok': True, **check}
-    if path == '/api/c1/test':
-        rec = c1_find(str(data.get('id') or ''))
-        if not rec:
-            raise ValueError('Подключение не найдено')
-        check = c1_conn_check(c1_form_data(rec), user)
-        c1_save_last_check(rec['id'], check)
-        log('info' if check['ok'] else 'error', f"1С прямое: проверка «{rec['name']}» — {check['message']}",
-            user=user.get('fio') or 'панель')
-        if not check['ok']:
-            raise ValueError(check['message'])
-        return {'ok': True, **check}
-    if path == '/api/c1/call':
-        rec = c1_find(str(data.get('id') or ''))
-        if not rec:
-            raise ValueError('Подключение не найдено')
-        if not rec.get('enabled'):
-            raise ValueError('Подключение отключено администратором')
-        if not c1_is_windows() or not c1_com_available():
-            raise ValueError('Прямое подключение к 1С работает только на Windows-сервере панели с pywin32 и установленной платформой 1С')
-        conn = c1_open_connection(c1_norm_connect(c1_assemble(c1_form_data(rec))))
+def src_save_last_check(sid, check):
+    with SOURCES_LOCK:
+        rows = src_load_raw()
+        for x in rows:
+            if x.get('id') == sid:
+                x['last_check'] = check
+        src_save_raw(rows)
+
+
+# --- MCP-транспорт: JSON-RPC вызовы к python-прокси (initialize, tools/list, tools/call) ---
+MCP_HANDSHAKE = {}    # id источника → True после успешного initialize на этом запуске сервера
+
+
+def mcp_ensure_init(rec):
+    """Handshake MCP: прокси по стандарту требует initialize перед другими методами.
+    Отправляем initialize + notifications/initialized один раз на источник за запуск
+    сервера; при неудаче — не кэшируем, следующая попытка повторит."""
+    sid = str(rec.get('id') or '')
+    if MCP_HANDSHAKE.get(sid):
+        return
+    mcp_rpc(rec, 'initialize', {
+        'protocolVersion': '2025-03-26',
+        'capabilities': {},
+        'clientInfo': {'name': 'Panel UOOZD', 'version': '14'}}, timeout=20)
+    try:   # notifications/initialized — ответ не ожидается (204), ошибка не фатальна
+        mcp_rpc(rec, 'notifications/initialized', None, timeout=10)
+    except ValueError:
+        pass
+    MCP_HANDSHAKE[sid] = True
+
+
+def mcp_reset(rec_or_id):
+    """Сброс handshake (источник изменён/удалён или прокси перезапускали)."""
+    sid = rec_or_id if isinstance(rec_or_id, str) else str((rec_or_id or {}).get('id') or '')
+    MCP_HANDSHAKE.pop(sid, None)
+
+
+
+
+def mcp_rpc(rec, method, params=None, timeout=None):
+    """Один JSON-RPC 2.0 запрос к MCP-прокси. → result или ValueError с текстом ошибки."""
+    p = rec.get('params') or {}
+    url = str(p.get('proxy_url') or '').strip()
+    if not url:
+        raise ValueError('У источника MCP не задан адрес прокси')
+    payload = {'jsonrpc': '2.0', 'id': int(time.time() * 1000) % 10**9, 'method': method}
+    if params is not None:
+        payload['params'] = params
+    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'),
+                                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    if str(p.get('auth') or '') == 'bearer' and p.get('password'):
+        req.add_header('Authorization', 'Bearer ' + str(p['password']))
+    ctx = None
+    if url.lower().startswith('https://') and p.get('ignore_cert'):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or 60, context=ctx) as resp:
+            j = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+    except urllib.error.HTTPError as e:
+        snippet = ''
         try:
-            res = c1_call(conn, data.get('module') or rec.get('module'),
-                          data.get('method') or rec.get('method'), data.get('param', rec.get('param')))
+            snippet = e.read(300).decode('utf-8', 'replace')
+        except Exception:
+            pass
+        raise ValueError(f'MCP-прокси ответил {e.code} {e.reason}. {snippet[:200]}') from e
+    except urllib.error.URLError as e:
+        raise ValueError(f'MCP-прокси недоступен: {getattr(e, "reason", e)}') from e
+    except socket.timeout as e:
+        raise ValueError(f'MCP-прокси не ответил за {timeout or 60} сек') from e
+    if isinstance(j, dict) and j.get('error'):
+        err = j['error']
+        raise ValueError(f"MCP: {err.get('message') or err}")
+    return (j or {}).get('result')
+
+
+def mcp_tool_call(rec, tool, args=None, timeout=None):
+    """tools/call → текст ответа инструмента MCP (из content[].text)."""
+    if not str(tool or '').strip():
+        raise ValueError('У источника MCP не задан имя инструмента')
+    mcp_ensure_init(rec)
+    try:
+        res = mcp_rpc(rec, 'tools/call', {'name': tool, 'arguments': args or {}}, timeout=timeout) or {}
+    except ValueError as e:
+        msg = str(e).lower()
+        if 'init' in msg or 'session' in msg:   # прокси перезапустили — одна повторная попытка с новым handshake
+            mcp_reset(rec)
+            mcp_ensure_init(rec)
+            res = mcp_rpc(rec, 'tools/call', {'name': tool, 'arguments': args or {}}, timeout=timeout) or {}
+        else:
+            raise
+    if res.get('isError'):
+        txt = '; '.join(c.get('text', '') for c in res.get('content') or [] if c.get('type') == 'text')
+        raise ValueError(f'Инструмент MCP «{tool}» вернул ошибку: {txt[:300]}')
+    out = []
+    for c in res.get('content') or []:
+        if c.get('type') == 'text':
+            out.append(c.get('text') or '')
+    text = '\n'.join(out).strip()
+    if text.startswith('{') or text.startswith('['):
+        try:
+            return json.loads(text)
+        except ValueError:
+            pass
+    return text
+
+
+# --- адаптеры источника: fields / rows / check ---
+
+def _src_odata_rec(rec):
+    p = rec.get('params') or {}
+    return {'id': rec['id'], 'name': rec.get('name'), 'base': p.get('base'), 'entity': p.get('entity'),
+            'login': p.get('login'), 'password': p.get('password'), 'filter': p.get('filter'),
+            'orderby': p.get('orderby'), 'top': p.get('top') or ODATA_PAGE,
+            'enabled': rec.get('enabled', True), 'ignore_cert': p.get('ignore_cert')}
+
+
+def _as_table(res):
+    """Разнообразный ответ 1С/MCP → таблица {'columns','rows','total'}."""
+    if isinstance(res, dict) and 'columns' in res:
+        return {'columns': res.get('columns') or [], 'rows': res.get('rows') or [],
+                'total': res.get('total') or len(res.get('rows') or [])}
+    if isinstance(res, list):
+        cols, seen = [], set()
+        for it in res:
+            if isinstance(it, dict):
+                for k in it:
+                    if k not in seen:
+                        seen.add(k)
+                        cols.append(k)
+        rows = [[_odata_cell(it.get(c) if isinstance(it, dict) else '') for c in cols] for it in res]
+        return {'columns': cols, 'rows': rows, 'total': len(rows)}
+    raise ValueError('Ответ источника не похож на таблицу (ожидались строки с полями)')
+
+
+def src_fields(rec):
+    """Поля источника для мастера сопоставления → [{'name','label'}]."""
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    if t == 'odata':
+        probe = {'base': p.get('base'), 'login': p.get('login'), 'password': p.get('password'),
+                 'ignore_cert': p.get('ignore_cert')}
+        sets = odata_service_info(probe)
+        ent = str(p.get('entity') or '').strip()
+        props = []
+        for s in sets:
+            if s.get('name') == ent:
+                props = s.get('props') or []
+                break
+        if props:
+            return [{'name': x.get('name'), 'label': x.get('title') or x.get('name')} for x in props]
+        q = odata_query(_src_odata_rec(rec), top=1)      # хотя бы одна строка → колонки
+        return [{'name': c, 'label': c} for c in q['columns']]
+    if t == 'com':
+        raise ValueError('Транспорт прямого COM удалён из панели — источник нужно пересоздать на OData или MCP')
+    # mcp: структура метаданных выбранного документа
+    obj = str(p.get('metadata_object') or '').strip()
+    if not obj:
+        raise ValueError('Для источника MCP укажите объект метаданных 1С (например, ДокументСсылка.Заказ)')
+    res = mcp_tool_call(rec, p.get('tool_meta'), {'ObjectName': obj})
+    if isinstance(res, dict):
+        fields = res.get('Fields') or res.get('fields') or res.get('Properties') or res.get('properties') or []
+        out = []
+        for f in fields:
+            if isinstance(f, dict):
+                nm = f.get('Name') or f.get('name') or ''
+                out.append({'name': nm, 'label': f.get('Description') or f.get('Synonym') or f.get('description') or nm})
+            elif isinstance(f, str):
+                out.append({'name': f, 'label': f})
+        if out:
+            return out
+    q = _as_table(res) if isinstance(res, (list, dict)) else None
+    if q:
+        return [{'name': c, 'label': c} for c in q['columns']]
+    raise ValueError('MCP не вернул список реквизитов — проверьте имя инструмента и объекта метаданных')
+
+
+def src_rows(rec, filt=None, orderby=None, top=None, skip=0, watermark=None):
+    """Строки источника → {'columns','rows','total'}. watermark: (поле, значение) — инкрементальная выборка."""
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    if t == 'odata':
+        f = str(filt if filt is not None else (p.get('filter') or '')).strip()
+        if watermark and watermark[1]:
+            wv = str(watermark[1]).replace("'", "''")
+            cond = f"{watermark[0]} gt datetime'{wv}'" if re.match(r'^\d{4}-', wv) else f"{watermark[0]} gt '{wv}'"
+            f = f'({f}) and ({cond})' if f else cond
+        return odata_query(_src_odata_rec(rec), entity=p.get('entity'), filt=f or None,
+                           orderby=str(orderby if orderby is not None else (p.get('orderby') or '')) or None,
+                           top=top, skip=skip)
+    if t == 'com':
+        raise ValueError('Транспорт прямого COM удалён из панели — источник нужно пересоздать на OData или MCP')
+    # mcp
+    args = {}
+    wf = str(p.get('watermark_field') or '').strip()
+    if watermark and watermark[1] and wf:
+        args[wf] = str(watermark[1])
+    if str(p.get('args_template') or '').strip():
+        try:
+            base_args = json.loads(p['args_template'])
+            if isinstance(base_args, dict):
+                args = {**base_args, **args}
+            else:
+                raise ValueError('Шаблон аргументов MCP должен быть JSON-объектом {"Поле": "значение"}')
+        except ValueError as e:
+            if 'Шаблон' in str(e):
+                raise
+            raise ValueError(f'Некорректный шаблон аргументов MCP: {str(e)[:120]}') from e
+    res = mcp_tool_call(rec, p.get('tool_data'), args)
+    return _as_table(res)
+
+
+def src_check(rec, actor):
+    checked_at = datetime.now().isoformat(timespec='seconds')
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    try:
+        if t == 'odata':
+            r = conn_check(p.get('base'), p.get('login'), p.get('password'), bool(p.get('ignore_cert')), p.get('entity'))
+            r['checked_at'] = checked_at
+            return r
+        if t == 'com':
+            return {'ok': False, 'checked_at': checked_at,
+                    'message': 'COM-транспорт удалён (панель кроссплатформенна) — пересоздайте источник на OData или MCP'}
+        mcp_ensure_init(rec)
+        info = mcp_rpc(rec, 'tools/list', {}, timeout=20) or {}
+        names = [x.get('name') for x in info.get('tools') or []]
+        need = [n for n in (p.get('tool_meta'), p.get('tool_data')) if n and n not in names]
+        msg = f'Прокси отвечает, инструментов MCP: {len(names)}'
+        if need:
+            return {'ok': False, 'message': msg + f'. Нет инструментов: {", ".join(need)}', 'checked_at': checked_at}
+        return {'ok': True, 'message': msg, 'tools': names[:100], 'checked_at': checked_at}
+    except ValueError as e:
+        return {'ok': False, 'message': str(e)[:400], 'checked_at': checked_at}
+
+
+def src_api(path, data, user):
+    """POST /api/src/… — раздел «Настройка источников» (только администратор)."""
+    if not user.get('admin'):
+        raise PermissionError('«Настройка источников» доступна только администратору')
+    if path == '/api/src/list':
+        return {'ok': True, 'items': [src_public(x) for x in src_load_raw()]}
+    if path == '/api/src/save':
+        return {'ok': True, 'item': src_save(data, user)}
+    if path == '/api/src/delete':
+        src_delete(str(data.get('id') or ''), user)
+        return {'ok': True}
+    rec = src_find(str(data.get('id') or ''))
+    if not rec:
+        raise ValueError('Источник не найден')
+    if not rec.get('enabled', True):
+        raise ValueError('Источник отключён администратором')
+    if path == '/api/src/check':
+        check = src_check(rec, user)
+        src_save_last_check(rec['id'], check)
+        log('info' if check['ok'] else 'error', f"Источники 1С: проверка «{rec['name']}» — {check['message']}",
+            user=user.get('fio') or 'панель')
+        return {'ok': True, **check}
+    if path == '/api/src/fields':
+        return {'ok': True, 'fields': src_fields(rec)}
+    if path == '/api/src/rows':
+        q = src_rows(rec, data.get('filter'), data.get('orderby'),
+                     min(int(data.get('top') or ODATA_PAGE), ODATA_MAX_ROWS), int(data.get('skip') or 0))
+        return {'ok': True, **q}
+    if path == '/api/src/mcp_tools':
+        mcp_ensure_init(rec)
+        info = mcp_rpc(rec, 'tools/list', {}, timeout=20) or {}
+        return {'ok': True, 'tools': [{'name': x.get('name'), 'description': (x.get('description') or '')[:200]}
+                                      for x in info.get('tools') or []]}
+    raise ValueError('Нет такой команды источника 1С')
+
+
+# =====================================================================
+# СОПОСТАВЛЕНИЕ РЕКВИЗИТОВ 1С ↔ ПАНЕЛЬ И СИНХРОНИЗАЦИЯ В РЕЕСТРЫ
+# Маппинг: источник (по id) + ключевое поле GUID + поля 1С → колонки реестра.
+# Строки реестра находятся по номеру закупки (колонка «Номер и Дата публикации»);
+# соответствие GUID↔номер запоминается в «Реестр — ключи 1С.json» после первого
+# ручного указания. При изменении документа в 1С строка перезаписывается.
+# Инкрементальная выборка — по watermark-полю источника (последняя дата прогона).
+# =====================================================================
+
+def map_load():
+    rows = _json_file(ФАЙЛ_МАППИНГИ, [])
+    return rows if isinstance(rows, list) else []
+
+
+def map_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_МАППИНГИ, json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def map_find(mid):
+    for x in map_load():
+        if x.get('id') == mid:
+            return x
+    return None
+
+
+def registry_columns(year=None):
+    """Колонки реестра Панели (для правой части мастера сопоставления)."""
+    Y = year_obj(year)
+    if not Y.registry.exists():
+        return []
+    try:
+        wb = load_workbook(Y.registry, read_only=True)
+    except PermissionError:
+        return []
+    try:
+        for ws in wb.worksheets:            # первый лист с шапкой реестра (без создания листов!)
+            data = list(ws.iter_rows(min_row=1, max_row=12, values_only=True))
+            top = None
+            for i, r in enumerate(data):
+                line = ' '.join(str(v or '').lower() for v in r)
+                if 'наименование' in line and 'номер и дата публикации' in norm(line):
+                    top = i
+                    break
+            if top is None:
+                continue
+            out = []
+            for h in data[top]:
+                h = ' '.join(str(h or '').split())
+                if h:
+                    out.append({'header': h, 'key': 'col:' + str(len(out) + 1), 'label': h})
+            return out
+        return []
+    finally:
+        wb.close()
+
+
+def mapping_suggest(src_fields_list, reg_cols_list):
+    """Автоподбор пар «поле 1С ↔ колонка реестра» по совпадению нормализованных имён."""
+    reg_by_key = {nkey(c['header']): c for c in reg_cols_list}
+    pairs = []
+    for f in src_fields_list:
+        fk = nkey(f.get('label') or f.get('name'))
+        hit = reg_by_key.get(fk)
+        if hit is None and fk:
+            for rk, c in reg_by_key.items():
+                if rk and (rk.startswith(fk) or fk.startswith(rk)) and min(len(rk), len(fk)) >= 5:
+                    hit = c
+                    break
+        if hit:
+            pairs.append({'src': f['name'], 'dst': hit['header']})
+    return pairs
+
+
+def keys_1c_load():
+    return _json_file(ФАЙЛ_КЛЮЧИ_1С, {}) or {}
+
+
+def keys_1c_put(guid, number):
+    if not guid or not number:
+        return
+    with STORE_LOCK:
+        d = keys_1c_load()
+        if d.get(guid) != number:
+            d[guid] = number
+            write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_КЛЮЧИ_1С, json.dumps(d, ensure_ascii=False, indent=1))
+
+
+def sync_log_append(entry):
+    rows = _json_file(ФАЙЛ_СИНХРО, [])
+    rows = (rows if isinstance(rows, list) else []) + [entry]
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СИНХРО, json.dumps(rows[-300:], ensure_ascii=False, indent=1))
+
+
+def sync_settings_load():
+    d = _json_file(ФАЙЛ_СИНХРО_НАСТР, None)
+    return d if isinstance(d, dict) else {'enabled': False, 'interval_min': 60, 'weekdays': [1, 2, 3, 4, 5],
+                                          'hours_from': 8, 'hours_to': 20, 'last_run': ''}
+
+
+def sync_settings_save(data, actor):
+    cur = sync_settings_load()
+    out = dict(cur)
+    out['enabled'] = bool(data.get('enabled', cur.get('enabled')))
+    out['interval_min'] = max(5, min(int(data.get('interval_min') or cur.get('interval_min') or 60), 24 * 60))
+    wd = data.get('weekdays')
+    if isinstance(wd, list):
+        out['weekdays'] = sorted({int(x) % 7 for x in wd if str(x).strip() != ''})
+    out['hours_from'] = max(0, min(int(data.get('hours_from') if data.get('hours_from') is not None else cur.get('hours_from', 8)), 23))
+    out['hours_to'] = max(1, min(int(data.get('hours_to') if data.get('hours_to') is not None else cur.get('hours_to', 20)), 24))
+    if out['hours_to'] <= out['hours_from']:
+        raise ValueError('Окончание времени должно быть позже начала')
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СИНХРО_НАСТР, json.dumps(out, ensure_ascii=False, indent=1))
+    log('edit', f"Синхронизация 1С: расписание {'вкл' if out['enabled'] else 'выкл'}, каждые {out['interval_min']} мин",
+        user=(actor or {}).get('fio') or 'панель')
+    return out
+
+
+def sync_due(now=None):
+    """Наступил ли слот авто-синхронизации (интервал + дни недели + окно часов)."""
+    s = sync_settings_load()
+    if not s.get('enabled'):
+        return False
+    now = now or datetime.now()
+    if now.weekday() not in set(s.get('weekdays') or []):
+        return False
+    if not (int(s.get('hours_from') or 0) <= now.hour < int(s.get('hours_to') or 24)):
+        return False
+    last = None
+    try:
+        last = datetime.fromisoformat(str(s.get('last_run') or ''))
+    except ValueError:
+        last = None
+    if last is None:
+        return True
+    return (now - last).total_seconds() >= int(s.get('interval_min') or 60) * 60
+
+
+def _sync_mark_run():
+    s = sync_settings_load()
+    s['last_run'] = datetime.now().isoformat(timespec='seconds')
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СИНХРО_НАСТР, json.dumps(s, ensure_ascii=False, indent=1))
+
+
+def sync_run(mapping, actor=None, dry=False):
+    """Один прогон сопоставления: читаем источник (с watermark), находим строку реестра, перезаписываем.
+
+    mapping: {'source','guid_field','map':{'поле 1С':'заголовок колонки'},'number_field'(опц.),
+              'watermark_field'(опц.)}. dry — только предпросмотр изменений без записи."""
+    mid = mapping.get('id') or ''
+    started_at = datetime.now().isoformat(timespec='seconds')
+    entry = {'at': started_at, 'mapping': mapping.get('name') or mid, 'dry': dry,
+             'read': 0, 'matched': 0, 'changed': 0, 'skipped': 0, 'errors': []}
+    rec = src_find(mapping.get('source') or '')
+    if not rec:
+        entry['errors'].append('Источник не найден (удалён?)')
+        entry['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        sync_log_append(entry)
+        return entry
+    if not rec.get('enabled', True):
+        entry['errors'].append('Источник отключён')
+        sync_log_append(entry)
+        return entry
+    wm_field = str(mapping.get('watermark_field') or '').strip()
+    wm_val = str(mapping.get('last_watermark') or '').strip() if wm_field else None
+    try:
+        q = src_rows(rec, watermark=(wm_field, wm_val) if wm_field else None,
+                     top=min(int(mapping.get('page_top') or ODATA_PAGE), ODATA_MAX_ROWS))
+    except ValueError as e:
+        entry['errors'].append(str(e)[:300])
+        sync_log_append(entry)
+        return entry
+    cols = q.get('columns') or []
+    col_of = {c: i for i, c in enumerate(cols)}
+    guid_col = mapping.get('guid_field') if mapping.get('guid_field') in col_of else (
+        'RefKey' if 'RefKey' in col_of else ('ID' if 'ID' in col_of else None))
+    num_col = mapping.get('number_field') if mapping.get('number_field') in col_of else None
+    fmap = {k: v for k, v in (mapping.get('map') or {}).items() if k in col_of and v}
+    keys = keys_1c_load()
+    new_wm = wm_val
+    if wm_field and wm_field in col_of:
+        vals = [str(r[col_of[wm_field]] or '') for r in q.get('rows') or [] if r[col_of[wm_field]]]
+        if vals:
+            new_wm = max(vals)
+    for row in (q.get('rows') or [])[:СИНХРО_МАКС_СТРОК]:
+        entry['read'] += 1
+        raw_guid = str(row[col_of[guid_col]] or '') if guid_col else ''
+        m = re.search(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', raw_guid)
+        guid = m.group(0).upper() if m else raw_guid.strip()
+        number = ''
+        if guid:
+            number = str(keys.get(guid) or '')
+        if not number and num_col:
+            number = re.sub(r'\s+', ' ', str(row[col_of[num_col]] or '')).strip()
+            if number and guid:
+                keys_1c_put(guid, number)
+        if not number:
+            entry['skipped'] += 1
+            continue
+        updates = {}
+        for src_f, dst_h in fmap.items():
+            v = row[col_of[src_f]]
+            if v in (None, ''):
+                continue
+            updates[dst_h] = v
+        if not updates:
+            entry['skipped'] += 1
+            continue
+        try:
+            changed = _sync_apply(number, updates, entry, dry)
+            if changed is None:
+                entry['skipped'] += 1
+            else:
+                entry['matched'] += 1
+                entry['changed'] += changed
+        except RegistryBusy as e:
+            entry['errors'].append(f'{number}: {str(e)[:120]}')
+        except Exception as e:
+            entry['errors'].append(f'{number}: {type(e).__name__}: {str(e)[:160]}')
+        time.sleep(0.01)
+    if new_wm and new_wm != wm_val and mid:
+        with SOURCES_LOCK:
+            rows = map_load()
+            for x in rows:
+                if x.get('id') == mid:
+                    x['last_watermark'] = new_wm
+            map_save_raw(rows)
+    entry['finished_at'] = datetime.now().isoformat(timespec='seconds')
+    sync_log_append(entry)
+    log('info' if not entry['errors'] else 'warn',
+        f"Синхронизация 1С «{entry['mapping']}»{' (предпросмотр)' if dry else ''}: прочитано {entry['read']}, "
+        f"совпало {entry['matched']}, изменено {entry['changed']}, пропущено {entry['skipped']}"
+        + (f", ошибок {len(entry['errors'])}" if entry['errors'] else ''),
+        user=(actor or {}).get('fio') or 'планировщик')
+    return entry
+
+
+def _sync_apply(number, updates, entry, dry):
+    """Перезапись ячеек строки реестра значениями из 1С. → число изменений или None (строка не найдена)."""
+    path = registry_of(number)
+    if not path:
+        return None
+    with REG_LOCK:
+        try:
+            wb = load_workbook(path) if not dry else load_workbook(path, read_only=True)
+        except PermissionError:
+            raise RegistryBusy('Реестр открыт в Excel')
+        try:
+            loc = locate(wb, number)
+            if not loc:
+                return None
+            heads_inv = {}
+            for c, h in (loc.get('heads') or {}).items():
+                heads_inv[nkey(h)] = c
+            changes = []
+            for header, value in updates.items():
+                col = heads_inv.get(nkey(header))
+                if not col:
+                    entry['errors'].append(f'{number}: колонка «{header[:40]}» не найдена в реестре')
+                    continue
+                cell = loc['ws'].cell(loc['row'], col)
+                old = cell.value
+                if isinstance(old, str) and old.startswith('='):
+                    continue          # формулы не трогаем
+                new = coerce(' '.join(str(header).split()), value)
+                if same_value(old, new):
+                    continue
+                if not dry:
+                    cell.value = safe(new) if new not in ('',) else None
+                changes.append({'col': col, 'header': header, 'old': cell_plain(old), 'new': cell_plain(new)})
+            if dry or not changes:
+                return len(changes) if changes else 0
+            save_workbook(wb, path)
+            return len(changes)
         finally:
-            conn = None  # COM-соединение закрывается освобождением объекта
             try:
-                import pythoncom
-                pythoncom.CoUninitialize()
+                wb.close()
             except Exception:
                 pass
-        log('info', f"1С прямое: «{rec['name']}» вызван {data.get('module') or rec.get('module')}.{data.get('method') or rec.get('method')}",
-            user=user.get('fio') or 'панель')
-        return {'ok': True, 'result': c1_result_to_jsonable(res)}
-    raise ValueError('Нет такой команды прямого подключения 1С')
 
 
-def odata_xlsx_bytes(res):
-    """Выгрузка результата OData-запроса в .xlsx (openpyxl)."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = (res.get('entity') or 'OData')[:31]
-    ws.append(res.get('columns') or [])
-    for c in ws[1]:
-        c.font = Font(bold=True)
-    for row in res.get('rows') or []:
-        ws.append(row)
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+def sync_auto_all(actor=None):
+    """Прогон всех сопоставлений с режимом auto (вызывает планировщик)."""
+    done = []
+    for m in map_load():
+        if m.get('mode') == 'auto' and m.get('enabled', True):
+            if not SOURCES_LOCK.acquire(blocking=False):
+                break
+            try:
+                done.append(sync_run(m, actor=actor or {'fio': 'планировщик'})['mapping'])
+            finally:
+                SOURCES_LOCK.release()
+    return done
+
+
+def watch_sync():
+    """Поток-планировщик авто-синхронизации: раз в минуту проверяет наступление слота."""
+    while True:
+        try:
+            if sync_due():
+                _sync_mark_run()
+                sync_auto_all()
+        except Exception as e:
+            log('error', f'Сбой планировщика синхронизации: {type(e).__name__}: {e}')
+        time.sleep(60)
+
+
+def sync_api(path, data, user):
+    """POST /api/sync/… — мастер сопоставления, прогоны, расписание, журнал, экспорт/импорт."""
+    if not user.get('admin'):
+        raise PermissionError('Сопоставление и синхронизация доступны только администратору')
+    if path == '/api/sync/maps':
+        return {'ok': True, 'items': map_load(), 'sources': [src_public(x) for x in src_load_raw()],
+                'settings': sync_settings_load(), 'log': (_json_file(ФАЙЛ_СИНХРО, []) or [])[-50:][::-1]}
+    if path == '/api/sync/columns':
+        Y = year_obj(data.get('year') or None)
+        return {'ok': True, 'columns': registry_columns(data.get('year')), 'year': Y.y}
+    if path == '/api/sync/fields':
+        rec = src_find(str(data.get('source') or ''))
+        if not rec:
+            raise ValueError('Источник не найден')
+        fl = src_fields(rec)
+        return {'ok': True, 'fields': fl}
+    if path == '/api/sync/suggest':
+        rec = src_find(str(data.get('source') or ''))
+        if not rec:
+            raise ValueError('Источник не найден')
+        return {'ok': True, 'pairs': mapping_suggest(src_fields(rec), registry_columns(data.get('year')))}
+    if path == '/api/sync/bind':
+        keys_1c_put(str(data.get('guid') or ''), str(data.get('number') or ''))
+        return {'ok': True}
+    if path == '/api/sync/save':
+        m = dict(data.get('mapping') or {})
+        if not str(m.get('name') or '').strip():
+            raise ValueError('Название сопоставления обязательно')
+        if not src_find(str(m.get('source') or '')):
+            raise ValueError('Выберите источник данных')
+        if not isinstance(m.get('map'), dict) or not m['map']:
+            raise ValueError('Не задано ни одного сопоставления полей')
+        m['id'] = str(m.get('id') or '')[:8] if m.get('id') else str(uuid.uuid4())[:8]
+        m['mode'] = 'auto' if m.get('mode') == 'auto' else 'manual'
+        m['enabled'] = bool(m.get('enabled', True))
+        m['updated_at'] = datetime.now().isoformat(timespec='seconds')
+        with SOURCES_LOCK:
+            rows = map_load()
+            rows = [m if x.get('id') == m['id'] else x for x in rows]
+            if not any(x.get('id') == m['id'] for x in rows):
+                rows.append(m)
+            map_save_raw(rows)
+        log('edit', f"Сопоставление 1С: «{m['name']}» сохранено", user=user.get('fio') or 'панель')
+        return {'ok': True, 'item': m}
+    if path == '/api/sync/delete':
+        with SOURCES_LOCK:
+            rows = [x for x in map_load() if x.get('id') != str(data.get('id') or '')]
+            map_save_raw(rows)
+        log('edit', f"Сопоставление 1С: удалено {data.get('id')}", user=user.get('fio') or 'панель')
+        return {'ok': True}
+    if path == '/api/sync/run':
+        m = map_find(str(data.get('id') or ''))
+        if not m:
+            raise ValueError('Сопоставление не найдено')
+        dry = bool(data.get('dry'))
+        if not SOURCES_LOCK.acquire(blocking=False):
+            raise ValueError('Синхронизация уже выполняется — подождите окончания текущего прогона')
+        try:
+            entry = sync_run(m, actor=user, dry=dry)
+        finally:
+            SOURCES_LOCK.release()
+        return {'ok': True, 'entry': entry}
+    if path == '/api/sync/settings':
+        return {'ok': True, 'settings': sync_settings_save(data, user)}
+    if path == '/api/sync/export':
+        ids = {x.get('id') for x in map_load()}
+        rows = [x for x in map_load() if not data.get('ids') or x.get('id') in set(data['ids'])]
+        blob = json.dumps({'kind': 'uoozd-mappings-v1', 'exported_at': datetime.now().isoformat(timespec='seconds'),
+                           'items': rows}, ensure_ascii=False, indent=1)
+        return {'ok': True, 'file_b64': base64.b64encode(blob.encode('utf-8')).decode('ascii'),
+                'name': 'Сопоставления 1С.json', 'count': len(rows)}
+    if path == '/api/sync/import':
+        try:
+            blob = base64.b64decode(str(data.get('file_b64') or '')).decode('utf-8')
+            doc = json.loads(blob)
+        except Exception as e:
+            raise ValueError(f'Файл не читается как JSON маппингов: {str(e)[:120]}') from e
+        items = doc.get('items') if isinstance(doc, dict) else None
+        if not isinstance(items, list):
+            raise ValueError('В файле нет списка «items» — это не экспорт сопоставлений панели')
+        src_ids = {x.get('id') for x in src_load_raw()}
+        added, skipped = 0, 0
+        with SOURCES_LOCK:
+            rows = map_load()
+            by_id = {x.get('id'): i for i, x in enumerate(rows)}
+            for m in items:
+                if not isinstance(m, dict) or not m.get('name') or not isinstance(m.get('map'), dict):
+                    skipped += 1
+                    continue
+                if m.get('source') not in src_ids:
+                    skipped += 1
+                    continue
+                m['id'] = str(uuid.uuid4())[:8]     # всегда новый id — не затираем существующие
+                m['last_watermark'] = ''
+                m['imported_at'] = datetime.now().isoformat(timespec='seconds')
+                rows.append(m)
+                added += 1
+            map_save_raw(rows)
+        log('edit', f'Сопоставления 1С: импорт — добавлено {added}, пропущено {skipped}', user=user.get('fio') or 'панель')
+        return {'ok': True, 'added': added, 'skipped': skipped}
+    raise ValueError('Нет такой команды синхронизации')
 
 
 def load_responsibles():
@@ -9118,8 +9552,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {'ok': True, **dirs_payload()})
             elif path.startswith('/api/odata/'):
                 self.send_json(200, odata_api(path, data, user))
-            elif path.startswith('/api/c1/'):
-                self.send_json(200, c1_api(path, data, user))
+            elif path.startswith('/api/src/'):
+                self.send_json(200, src_api(path, data, user))
+            elif path.startswith('/api/sync/'):
+                self.send_json(200, sync_api(path, data, user))
             elif path == '/api/dirs/save':
                 if not user.get('admin'):
                     self.send_json(403, {'ok': False, 'message': 'Справочники меняет администратор'})
@@ -9452,9 +9888,19 @@ def main():
     print('Работает. Остановить — Ctrl+C (в PyCharm — красный квадрат).\n')
 
     log('info', f'Панель запущена на {HOST}:{ПОРТ}')
+    try:
+        src_migrate_once()          # старые подключения OData/COM → единые «Источники 1С»
+    except Exception as e:
+        log('error', f'Миграция источников 1С не выполнена: {type(e).__name__}: {e}')
     threading.Thread(target=watch_folder, daemon=True).start()
+    threading.Thread(target=watch_sync, daemon=True).start()   # планировщик авто-синхронизации 1С
     if ОТКРЫТЬ_ПАНЕЛЬ:
-        threading.Timer(1.0, lambda: webbrowser.open(f'http://localhost:{ПОРТ}')).start()
+        def _open_browser():
+            try:
+                webbrowser.open(f'http://localhost:{ПОРТ}')
+            except Exception:      # headless-сервер без браузера (в т.ч. Linux) — не критично
+                pass
+        threading.Timer(1.0, _open_browser).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -10966,7 +11412,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <div class="body">
       <div class="oz-lists" id="ozListsBox"></div>
       <div class="f" style="margin-top:14px"><label for="ozInitDepts">Инициатор = подразделение <span class="muted">(подставляется при выборе инициатора)</span></label><textarea id="ozInitDepts" rows="6" placeholder="Иванов И.И. = Лаборатория № 1"></textarea></div>
-      <div class="sheet-foot" style="padding:12px 0 0"><span class="muted">Сотрудники ОПАиЗ и ОАО — во вкладке «Настройки» → «Справочники»</span><span class="grow"></span><button class="btn primary" id="ozListsSave">Сохранить справочники</button></div>
+      <div class="sheet-foot" style="padding:12px 0 0"><span class="muted">Сотрудники ОПАиЗ и ОАО — во вкладке «Администрирование» → «Справочники»</span><span class="grow"></span><button class="btn primary" id="ozListsSave">Сохранить справочники</button></div>
     </div>
   </section>
 </div>
@@ -10988,6 +11434,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <span class="grow"></span>
     <span class="seg yswitch" id="ovYear" role="group" aria-label="Год договора"></span>
     <span class="muted oz-sync" id="ovSync"></span>
+    <button type="button" class="btn" id="ovRescan" title="Заново просканировать папку платёжек">⟳ Пересканировать папку</button>
   </div>
 
   <!-- Мой день / День отдела -->
@@ -11081,12 +11528,19 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
 </div>
 
 <div class="view" id="viewUsers">
-  <section class="card">
+  <div class="seg" id="admTabs" role="group" aria-label="Разделы администрирования" style="width:auto;margin-bottom:14px">
+    <button type="button" data-adm="users" aria-pressed="true">Пользователи</button>
+    <button type="button" data-adm="dirs" aria-pressed="false">Справочники</button>
+    <button type="button" data-adm="src" aria-pressed="false">Настройка источников</button>
+    <button type="button" data-adm="sync" aria-pressed="false">Сопоставление и синхронизация</button>
+    <button type="button" data-adm="sched" aria-pressed="false">Расписание</button>
+  </div>
+  <section class="card adm-pane" data-pane="users">
     <h2>Пользователи <span class="muted" id="usersMode"></span></h2>
     <div class="toolbar"><span class="muted">Каждый видит вкладку своего отдела и реестры ОАО; администраторы — всё. Удалять записи из реестра может только сотрудник с правом «удаление».</span><span class="grow"></span><button class="btn primary" id="userAdd">+ Пользователь</button></div>
     <div class="tablewrap"><table class="at" id="usersTable"></table></div>
   </section>
-  <section class="card" style="margin-top:16px">
+  <section class="card adm-pane" data-pane="dirs" hidden>
     <h2>Справочники <span class="muted">видны всем, меняет администратор; ФИО приводятся к виду «Фамилия И.О.»</span></h2>
     <div class="body dirs">
       <div><h3>Комиссия по закупкам</h3><div id="dirComm"></div><button class="btn sm" data-dadd="comm">+ добавить</button></div>
@@ -11098,29 +11552,32 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <div><button class="btn primary" id="dirSave">Сохранить справочники</button></div>
     </div>
   </section>
-  <section class="card" style="margin-top:16px">
-    <h2>Подключение к 1С <span class="muted">подключения видят и настраивают только администраторы</span></h2>
-    <div class="toolbar"><span class="muted">Публикации 1С по протоколу OData (адрес вида http://сервер/база/odata или …/hs/odata). Подключения хранятся в папке панели; пароль в браузер не отдаётся.</span><span class="grow"></span><button class="btn primary" id="odAdd">+ Подключение</button></div>
-    <div class="tablewrap"><table class="at" id="odTable"></table></div>
-    <div class="warnbox" id="odListWarn" style="margin:8px 0 0"></div>
+  <section class="card adm-pane" data-pane="src" hidden>
+    <h2>Источники данных 1С <span class="muted">список из N источников: OData или MCP-прокси; видят и настраивают только администраторы</span></h2>
+    <div class="toolbar"><span class="muted" id="srcModeHint">Каждый источник — отдельный способ подключения со своими параметрами. Хранятся в папке панели; пароли в браузер не отдаются.</span><span class="grow"></span><button class="btn primary" id="srcAdd">+ Источник</button></div>
+    <div class="tablewrap"><table class="at" id="srcTable"></table></div>
+    <div class="warnbox" id="srcListWarn" style="margin:8px 0 0"></div>
   </section>
-  <section class="card" style="margin-top:16px" id="odQueryCard" hidden>
-    <h2>Запрос к выбранному подключению <span class="muted" id="odConnName"></span></h2>
-    <div class="fgrid" style="gap:8px 12px;margin-bottom:8px">
-      <div class="f"><label>Таблица 1С (набор данных)</label><select id="odEntity"></select></div>
-      <div class="f"><label>$filter — условие отбора (OData)</label><input id="odFilter" placeholder="например, СуммаДокумента gt 100000"></div>
-      <div class="f"><label>$orderby — сортировка</label><input id="odOrderby" placeholder="например, Дата desc"></div>
-      <div class="f"><label>Строк на страницу</label><input id="odTop" inputmode="numeric" value="50"></div>
+  <section class="card adm-pane" data-pane="sync" hidden>
+    <h2>Сопоставление реквизитов и синхронизация <span class="muted">поля источника 1С → колонки реестра Панели; ключ — GUID строки</span></h2>
+    <div class="toolbar"><span class="muted">Синхронизация обновляет найденные строки реестра значениями из 1С (пустые значения не перезаписывают, формулы не трогаются). Перед применением — предпросмотр изменений.</span><span class="grow"></span><button class="btn" id="syncExport">Экспорт в JSON</button><label class="btn" style="cursor:pointer">Импорт из JSON<input type="file" id="syncImportFile" accept=".json" hidden></label><button class="btn primary" id="mapAdd">+ Сопоставление</button></div>
+    <div class="tablewrap"><table class="at" id="mapTable"></table></div>
+    <div class="warnbox" id="syncWarn" style="margin:8px 0 0"></div>
+    <h3 style="margin-top:16px">Журнал прогонов</h3>
+    <div class="tablewrap"><table class="at" id="syncLog"></table></div>
+  </section>
+  <section class="card adm-pane" data-pane="sched" hidden>
+    <h2>Расписание авто-синхронизации <span class="muted">панель сама опрашивает источники в заданные интервалы</span></h2>
+    <div class="fgrid" style="gap:10px 14px;margin-bottom:10px">
+      <div class="f full"><label class="chk"><input type="checkbox" id="schEnabled"> Авто-синхронизация включена (выполняются сопоставления с режимом «авто»)</label></div>
+      <div class="f"><label>Интервал, минут</label><input id="schInterval" inputmode="numeric" value="60"></div>
+      <div class="f"><label>Часов с / по</label><input id="schFrom" inputmode="numeric" value="8" style="width:45%"> — <input id="schTo" inputmode="numeric" value="20" style="width:45%"></div>
+      <div class="f full"><label>Дни недели</label><div class="checks" id="schDays">
+        <label><input type="checkbox" value="1"> Пн</label><label><input type="checkbox" value="2"> Вт</label><label><input type="checkbox" value="3"> Ср</label><label><input type="checkbox" value="4"> Чт</label><label><input type="checkbox" value="5"> Пт</label><label><input type="checkbox" value="6"> Сб</label><label><input type="checkbox" value="0"> Вс</label></div></div>
+      <div class="f full"><span class="muted" id="schLast"></span></div>
     </div>
-    <div class="toolbar"><button class="btn primary" id="odRun">Запросить</button><button class="btn" id="odXlsx">Выгрузить в Excel</button><span class="muted" id="odInfo"></span><span class="grow"></span><button class="btn sm" id="odPrev">← предыдущая страница</button><button class="btn sm" id="odNext">следующая страница →</button></div>
-    <div class="warnbox" id="odWarn" style="margin:0 0 8px"></div>
-    <div class="tablewrap"><table class="at" id="odResult"></table></div>
-  </section>
-  <section class="card" style="margin-top:16px">
-    <h2>Подключение к 1С без веб-публикации <span class="muted">прямое COM-соединение с базой (File="…";Usr="…" или Srvr="…";Ref="…")</span></h2>
-    <div class="toolbar"><span class="muted" id="c1ModeHint">Для баз, которые не опубликованы как OData: панель обращается к базе напрямую через COM-соединение 1С. Работает на Windows-сервере панели с установленной платформой 1С.</span><span class="grow"></span><button class="btn primary" id="c1Add">+ Подключение</button></div>
-    <div class="tablewrap"><table class="at" id="c1Table"></table></div>
-    <div class="warnbox" id="c1ListWarn" style="margin:8px 0 0"></div>
+    <div class="toolbar"><button class="btn primary" id="schSave">Сохранить расписание</button></div>
+    <div class="warnbox" id="schWarn" style="margin:8px 0 0"></div>
   </section>
 </div>
 </div>
@@ -11359,45 +11816,79 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   </div>
 </div>
 
-<!-- ПОДКЛЮЧЕНИЕ 1С ODATA -->
-<div class="modal" id="odm" role="dialog" aria-modal="true" aria-labelledby="odmTitle">
-  <div class="sheet" style="width:min(640px,100%)">
-    <div class="sheet-head"><h2 id="odmTitle">Подключение к базе 1С</h2><button class="btn x" data-close="odm" aria-label="Закрыть">✕</button></div>
-    <div class="warnbox" id="odmWarn"></div>
+<!-- ИСТОЧНИК ДАННЫХ 1С (OData / MCP) — раздел «Настройка источников» -->
+<div class="modal" id="srcm" role="dialog" aria-modal="true" aria-labelledby="srcmTitle">
+  <div class="sheet" style="width:min(700px,100%)">
+    <div class="sheet-head"><h2 id="srcmTitle">Источник данных 1С</h2><span class="muted" id="srcmSub"></span><button class="btn x" data-close="srcm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="srcmWarn"></div>
     <div style="padding:14px 22px" class="fgrid">
-      <div class="f full"><label for="odmName">Название подключения</label><input id="odmName" placeholder="например, 1С БГУ — основная" autocomplete="off"></div>
-      <div class="f full"><label for="odmBase">Адрес OData публикации 1С <span class="req">*</span></label><input id="odmBase" placeholder="http://сервер/база/odata/" autocomplete="off"><div class="hint">или расширение …/hs/odata; панель обратится к адресу и к $metadata</div></div>
-      <div class="f"><label for="odmEntity">Таблица по умолчанию (набор данных)</label><input id="odmEntity" placeholder="например, ЗаказПокупателя" autocomplete="off"></div>
-      <div class="f"><label for="odmTop">Строк на страницу</label><input id="odmTop" inputmode="numeric" value="50"></div>
-      <div class="f"><label for="odmLogin">Пользователь 1С (basic)</label><input id="odmLogin" autocomplete="off"></div>
-      <div class="f"><label for="odmPass">Пароль</label><input id="odmPass" type="password" autocomplete="new-password"><div class="hint" id="odmPassHint"></div></div>
-      <div class="f full"><label for="odmFilter">Фильтр по умолчанию ($filter)</label><input id="odmFilter" placeholder="можно оставить пустым"></div>
-      <div class="f full"><label for="odmOrderby">Сортировка по умолчанию ($orderby)</label><input id="odmOrderby" placeholder="например, Дата desc"></div>
-      <label class="chk full"><input type="checkbox" id="odmEnabled"> подключение включено (пока выключено — запросы к нему запрещены)</label>
-      <label class="chk full"><input type="checkbox" id="odmIgnoreCert"> не проверять сертификат при https (для самоподписанных)</label>
+      <div class="f full"><label for="srcmName">Название источника <span class="req">*</span></label><input id="srcmName" placeholder="например, 1С БГУ — основная" autocomplete="off"></div>
+      <div class="f full"><label>Транспорт подключения</label>
+        <div class="seg" id="srcmTransport" style="width:auto">
+          <button type="button" data-tr="odata" aria-pressed="true">OData</button>
+          <button type="button" data-tr="mcp" aria-pressed="false">MCP-прокси</button>
+        </div>
+        <div class="hint" id="srcmTrHint"></div></div>
+      <div class="tr-block" data-for="odata" style="display:contents">
+        <div class="f full"><label for="srcmBase">Адрес OData публикации 1С <span class="req">*</span></label><input id="srcmBase" placeholder="http://сервер/база/odata/" autocomplete="off"><div class="hint">или расширение …/hs/odata; панель обратится к адресу и к $metadata</div></div>
+        <div class="f"><label for="srcmEntity">Набор данных (таблица)</label><input id="srcmEntity" placeholder="например, ЗаказПокупателя" autocomplete="off"><div class="hint" id="srcmEntityHint"></div></div>
+        <div class="f"><label for="srcmTop">Строк на страницу</label><input id="srcmTop" inputmode="numeric" value="50"></div>
+        <div class="f"><label for="srcmLogin">Пользователь 1С (basic)</label><input id="srcmLogin" autocomplete="off"></div>
+        <div class="f"><label for="srcmPass">Пароль</label><input id="srcmPass" type="password" autocomplete="new-password"><div class="hint" id="srcmPassHint"></div></div>
+        <div class="f full"><label for="srcmFilter">Фильтр по умолчанию ($filter)</label><input id="srcmFilter" placeholder="можно оставить пустым"></div>
+        <div class="f full"><label for="srcmOrderby">Сортировка по умолчанию ($orderby)</label><input id="srcmOrderby" placeholder="например, Дата desc"></div>
+        <label class="chk full"><input type="checkbox" id="srcmIgnoreCert"> не проверять сертификат при https (для самоподписанных)</label>
+      </div>
+      <div class="tr-block" data-for="mcp" hidden style="display:contents">
+        <div class="f full"><label for="srcmProxy">Адрес MCP-прокси <span class="req">*</span></label><input id="srcmProxy" placeholder="http://хост:8085/mcp" autocomplete="off"><div class="hint">python-прокси MCP-сервера 1С (src/py_server): stdio-режим не подходит — нужен HTTP-эндпоинт /mcp</div></div>
+        <div class="f"><label for="srcmAuth">Авторизация прокси</label><select id="srcmAuth"><option value="none">без авторизации</option><option value="bearer">Bearer-токен</option></select></div>
+        <div class="f"><label for="srcmToken">Токен / пароль</label><input id="srcmToken" type="password" autocomplete="new-password"><div class="hint" id="srcmTokenHint"></div></div>
+        <div class="f"><label for="srcmToolMeta">Инструмент структуры метаданных</label><input id="srcmToolMeta" value="get_metadata_structure" autocomplete="off"></div>
+        <div class="f"><label for="srcmToolData">Инструмент выборки данных</label><input id="srcmToolData" placeholder="например, get_orders" autocomplete="off"></div>
+        <div class="f full"><label for="srcmMetaObj">Объект метаданных 1С</label><input id="srcmMetaObj" placeholder="например, Документ.ЗаказПокупателя" autocomplete="off"><div class="hint">для списка реквизитов в мастере сопоставления; аргумент ObjectName инструмента структуры</div></div>
+        <div class="f full"><label for="srcmArgs">Шаблон аргументов инструмента данных (JSON)</label><input id="srcmArgs" placeholder='{"UserName": "УООЗД"}' autocomplete="off"></div>
+        <div class="f full"><label for="srcmWm">Watermark-поле источника (инкрементальная выборка)</label><input id="srcmWm" placeholder="например, ДатаИзменения — можно задать и в сопоставлении" autocomplete="off"></div>
+        <div class="f full"><span class="muted" id="srcmTools"></span></div>
+      </div>
+      <label class="chk full"><input type="checkbox" id="srcmEnabled"> источник включён (пока выключен — обращения запрещены)</label>
     </div>
-    <div class="sheet-foot"><button class="btn" id="odmDelete">Удалить подключение</button><button class="btn" id="odmCheck">Проверить подключение</button><span class="grow"></span><button class="btn primary" id="odmSave">Сохранить</button></div>
+    <div class="sheet-foot"><button class="btn" id="srcmDelete">Удалить источник</button><button class="btn" id="srcmCheck">Проверить соединение</button><span class="grow"></span><button class="btn primary" id="srcmSave">Сохранить</button></div>
   </div>
 </div>
 
-<div class="modal" id="c1m" role="dialog" aria-modal="true" aria-labelledby="c1mTitle">
-  <div class="sheet" style="width:min(680px,100%)">
-    <div class="sheet-head"><h2 id="c1mTitle">Прямое подключение к базе 1С (COM)</h2><button class="btn x" data-close="c1m" aria-label="Закрыть">✕</button></div>
-    <div class="warnbox" id="c1mWarn"></div>
+<!-- МАСТЕР СОПОСТАВЛЕНИЯ РЕКВИЗИТОВ 1С ↔ КОЛОНКИ РЕЕСТРА -->
+<div class="modal" id="mapm" role="dialog" aria-modal="true" aria-labelledby="mapmTitle">
+  <div class="sheet" style="width:min(900px,100%)">
+    <div class="sheet-head"><h2 id="mapmTitle">Сопоставление реквизитов</h2><span class="muted">поля источника → колонки реестра Панели; ключ — GUID</span><button class="btn x" data-close="mapm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="mapmWarn"></div>
     <div style="padding:14px 22px" class="fgrid">
-      <div class="f full"><label for="c1mName">Название подключения</label><input id="c1mName" placeholder="например, 1С БГУ — файловая копия" autocomplete="off"></div>
-      <div class="f full"><label for="c1mConnect">Готовая строка соединения</label><input id="c1mConnect" placeholder='File="C:\Базы\Закупки";Usr="Иванов"' autocomplete="off"><div class="hint">файловая база: File="путь к каталогу"; · клиент-серверная: Srvr="сервер";Ref="имя базы"; — можно оставить пустым и заполнить поля ниже</div></div>
-      <div class="f"><label for="c1mServer">Сервер 1С</label><input id="c1mServer" placeholder="srv1c:1541 — пусто = файловая база" autocomplete="off"></div>
-      <div class="f"><label for="c1mBase">Путь к базе / имя базы</label><input id="c1mBase" placeholder="C:\Базы\Закупки или имя на сервере" autocomplete="off"></div>
-      <div class="f"><label for="c1mUser">Пользователь 1С</label><input id="c1mUser" autocomplete="off"></div>
-      <div class="f"><label for="c1mPass">Пароль</label><input id="c1mPass" type="password" autocomplete="new-password"><div class="hint" id="c1mPassHint"></div></div>
-      <div class="f"><label for="c1mModule">Общий модуль 1С</label><input id="c1mModule" placeholder="например, УООЗД_Интеграция" autocomplete="off"></div>
-      <div class="f"><label for="c1mMethod">Экспортная функция/процедура</label><input id="c1mMethod" placeholder="например, ПроверитьСвязь" autocomplete="off"></div>
-      <div class="f full"><label for="c1mParam">Параметр вызова (строка)</label><input id="c1mParam" placeholder="можно оставить пустым" autocomplete="off"></div>
-      <div class="f full"><label for="c1mDesc">Комментарий</label><input id="c1mDesc" placeholder="зачем это подключение" autocomplete="off"></div>
-      <label class="chk full"><input type="checkbox" id="c1mEnabled"> подключение включено (пока выключено — вызовы к нему запрещены)</label>
+      <div class="f"><label for="mapmName">Название сопоставления <span class="req">*</span></label><input id="mapmName" placeholder="например, Заказы → реестр 2026" autocomplete="off"></div>
+      <div class="f"><label for="mapmSource">Источник данных</label><select id="mapmSource"></select></div>
+      <div class="f"><label for="mapmYear">Реестр года</label><select id="mapmYear"></select></div>
+      <div class="f"><label for="mapmMode">Режим</label><select id="mapmMode"><option value="manual">ручной запуск</option><option value="auto">авто по расписанию</option></select></div>
+      <div class="f"><label for="mapmGuid">GUID-поле источника</label><select id="mapmGuid"><option value="">авто (RefKey / ID)</option></select></div>
+      <div class="f"><label for="mapmNumber">Поле с номером закупки (опционально)</label><select id="mapmNumber"><option value="">— не задано —</option></select></div>
+      <div class="f"><label for="mapmWm">Watermark-поле (инкрементальная выборка)</label><select id="mapmWm"><option value="">— без watermark —</option></select></div>
+      <label class="chk"><input type="checkbox" id="mapmEnabled"> сопоставление включено</label>
+      <div class="f full"><div class="toolbar" style="margin:0"><span class="muted" id="mapmPairsInfo">сопоставлено пар: 0</span><span class="grow"></span><button class="btn sm" id="mapmSuggest">Подобрать автоматически</button></div>
+        <div class="tablewrap" style="max-height:320px;overflow:auto"><table class="at" id="mapmPairs"></table></div>
+        <div class="hint">левая колонка — поле из 1С, правая — заголовок колонки реестра Панели; пустые значения из 1С не перезаписывают ячейки, формулы не трогаются.</div></div>
+      <div class="f full"><label>Первое сопоставление GUID ↔ номер (если в 1С нет номера закупки)</label>
+        <div class="row" style="gap:8px;flex-wrap:wrap"><input id="mapmBindGuid" placeholder="GUID строки из предпросмотра источника" style="flex:1;min-width:260px"><input id="mapmBindNum" placeholder="номер закупки в реестре, напр. 412зцп" style="flex:1;min-width:200px"><button class="btn sm" id="mapmBindBtn">Запомнить</button></div>
+        <div class="hint">достаточно указать один раз для каждой строки — соответствие сохранится; дальше синхронизация найдёт строку сама.</div></div>
     </div>
-    <div class="sheet-foot"><button class="btn" id="c1mDelete">Удалить подключение</button><button class="btn" id="c1mCheck">Проверить подключение</button><span class="grow"></span><button class="btn primary" id="c1mSave">Сохранить</button></div>
+    <div class="sheet-foot"><button class="btn" id="mapmPreview">Предпросмотр строк источника</button><span class="grow"></span><button class="btn primary" id="mapmSave">Сохранить сопоставление</button></div>
+    <div class="tablewrap" id="mapmPreviewWrap" hidden style="max-height:260px;overflow:auto;margin:0 22px 14px"><table class="at" id="mapmPreviewTbl"></table></div>
+  </div>
+</div>
+
+<!-- ПРЕДПРОСМОТР ПРОГОНА СИНХРОНИЗАЦИИ (dry-run) -->
+<div class="modal" id="syncp" role="dialog" aria-modal="true" aria-labelledby="syncpTitle">
+  <div class="sheet" style="width:min(900px,100%)">
+    <div class="sheet-head"><h2 id="syncpTitle">Предпросмотр синхронизации</h2><span class="muted" id="syncpSub"></span><button class="btn x" data-close="syncp" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="syncpWarn"></div>
+    <div style="padding:14px 22px" id="syncpBody"></div>
+    <div class="sheet-foot"><span class="grow"></span><button class="btn" data-close="syncp">Закрыть</button><button class="btn primary" id="syncpApply">Применить изменения</button></div>
   </div>
 </div>
 
@@ -12499,7 +12990,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     if (v === 'an') renderAnalytics();
     if (v === 'rep') renderReports();
     if (v === 'sup') loadSuppliers(true).then(renderSuppliers);
-    if (v === 'users') { loadUsers(); loadDirs(); loadOdata(); loadC1(); }
+    if (v === 'users') { loadUsers(); loadDirs(); setAdmTab(restore('reestr-adm-tab') || 'users'); }
     if (v === 'opaiz') renderOz();
     if (v === 'ovrk') renderOvrk();
     if (v === 'plan' || v === 'planDept') renderPlan();
@@ -16111,7 +16602,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   function canSeeDept(d) { var u = AUTH.user; return !u || u.admin || d === 'ОАО' || d === 'УЗ' || d === 'ИНИЦ' || u.dept === d; }
   function renderDepts() {
     var u = AUTH.user, list = DEPTS.filter(function (d) { return canSeeDept(d[0]); });
-    if (u && u.admin) list = list.concat([['users', 'Настройки']]);
+    if (u && u.admin) list = list.concat([['users', 'Администрирование']]);
     if (!list.some(function (d) { return d[0] === state.dept; })) state.dept = 'ОАО';
     $('deptTabs').innerHTML = list.map(function (d) { return '<button type="button" data-dept="' + d[0] + '" title="' + esc(DEPT_FULL[d[0]] || '') + '" aria-selected="' + (d[0] === state.dept) + '">' + esc(d[1]) + '</button>'; }).join('');
   }
@@ -16532,232 +17023,424 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     });
   };
 
-  // --- Базы 1С (OData) — Администрирование, только администратор ---
-  var OD = { list: [], id: '', entities: {}, skip: 0, columns: [], rows: [], total: 0, entity: '' };
-  function odConn(id) { return OD.list.filter(function (x) { return x.id === id; })[0] || null; }
-  function loadOdata() {
+  // =====================================================================
+  // АДМИНИСТРИРОВАНИЕ: подтабы разделов (пользователи, справочники,
+  // источники 1С, сопоставления, расписание синхронизации)
+  // =====================================================================
+  var ADM_TABS = ['users', 'dirs', 'src', 'sync', 'sched'];
+  function setAdmTab(t) {
+    if (ADM_TABS.indexOf(t) < 0) t = 'users';
+    store('reestr-adm-tab', t);
+    Array.prototype.forEach.call(document.querySelectorAll('#admTabs [data-adm]'), function (b) {
+      b.setAttribute('aria-pressed', b.dataset.adm === t ? 'true' : 'false'); });
+    Array.prototype.forEach.call($('viewUsers').querySelectorAll('.adm-pane'), function (s) {
+      s.hidden = s.dataset.pane !== t; });
+    if (t === 'src') loadSources();
+    if (t === 'sync') loadSync();
+    if (t === 'sched') loadSch();
+  }
+  $('admTabs').onclick = function (e) { var b = e.target.closest('[data-adm]'); if (b) setAdmTab(b.dataset.adm); };
+
+  // =====================================================================
+  // НАСТРОЙКА ИСТОЧНИКОВ 1С (OData / MCP-прокси) — только админ
+  // =====================================================================
+  var SRC = { list: [], editing: '', transport: 'odata' };
+  var TR_HINT = {
+    odata: 'Публикация OData в 1С (или общий HTTP-сервис …/hs/odata). Самый простой способ для веб-панели.',
+    mcp: 'Подключение через python-прокси MCP-сервера 1С: база → расширение mcp.cfe → прокси /mcp → панель.'
+  };
+  var TR_NAME = { odata: 'OData', com: 'COM (удалён)', mcp: 'MCP' };
+  function srcById(id) { return SRC.list.filter(function (x) { return x.id === id; })[0] || null; }
+  function loadSources() {
     if (!(AUTH.user && AUTH.user.admin)) return;
-    api('/api/odata/list', {}).then(function (res) {
-      if (!res.ok) { $('odTable').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message || 'Нет доступа') + '</td></tr></tbody>'; return; }
-      OD.list = res.items || [];
-      renderOdataConns();
+    api('/api/src/list', {}).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message || 'Нет доступа')); return; }
+      SRC.list = res.items || [];
+      renderSrcTable();
     });
   }
-  function renderOdataConns() {
-    $('odTable').innerHTML = '<thead><tr><th>Название</th><th>Адрес OData</th><th>Таблица по умолчанию</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
-      (OD.list.length ? OD.list.map(function (x) {
-        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td><td class="l">' + esc(x.base) + '</td><td>' + esc(x.entity || '—') + '</td>' +
-          '<td>' + (x.login ? esc(x.login) : 'анонимно') + (x.has_password ? ' <span class="pill ok">пароль задан</span>' : '') + '</td>' +
-          '<td>' + (x.enabled ? '<span class="pill ok">включено</span>' : '<span class="pill warn">выключено</span>') + '</td>' +
-          '<td style="white-space:nowrap"><button class="btn sm" data-odtest="' + esc(x.id) + '">Проверить</button> ' +
-          '<button class="btn sm' + (x.enabled ? ' primary' : '') + '" data-odq="' + esc(x.id) + '">Запрос</button> ' +
-          '<button class="btn sm" data-odedit="' + esc(x.id) + '">Изменить</button></td></tr>';
-      }).join('') : '<tr><td colspan="6" class="empty">Подключений пока нет — нажмите «+ Подключение».</td></tr>') + '</tbody>';
+  function srcSummary(x) {
+    var p = x.params || {};
+    if (x.transport === 'odata') return p.base || '—';
+    return (p.proxy_url || '—') + (p.tool_data ? ' · ' + p.tool_data : '');
   }
-  $('odAdd').onclick = function () { openOdataConn(null); };
-  $('odTable').onclick = function (e) {
-    var t = e.target.closest('[data-odtest]'), q = e.target.closest('[data-odq]'), ed = e.target.closest('[data-odedit]');
-    if (t) odataTest(t.dataset.odtest);
-    else if (q) odataOpenQuery(q.dataset.odq);
-    else if (ed) openOdataConn(odConn(ed.dataset.odedit));
+  function renderSrcTable() {
+    $('srcTable').innerHTML = '<thead><tr><th>Название</th><th>Транспорт</th><th class="l">Параметры</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
+      (SRC.list.length ? SRC.list.map(function (x) {
+        var lc = x.last_check || {}, p = x.params || {};
+        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td>' +
+          '<td>' + (TR_NAME[x.transport] || x.transport) + '</td>' +
+          '<td class="l">' + esc(srcSummary(x)).slice(0, 160) + '</td>' +
+          '<td>' + (esc(p.login || '') || (x.transport === 'mcp' ? (p.auth === 'bearer' ? 'Bearer' : 'без авторизации') : 'анонимно')) +
+            (x.has_password ? ' <span class="pill ok">секрет задан</span>' : '') + '</td>' +
+          '<td>' + (x.enabled ? '<span class="pill ok">включён</span>' : '<span class="pill warn">выключен</span>') +
+            (lc.checked_at ? '<br><span class="muted">' + (lc.ok ? '✓ ' : '✕ ') + esc((lc.checked_at || '').replace('T', ' ')) + '</span>' : '') + '</td>' +
+          '<td style="white-space:nowrap"><button class="btn sm" data-srctest="' + esc(x.id) + '">Проверить</button> ' +
+          '<button class="btn sm" data-srcfields="' + esc(x.id) + '">Поля</button> ' +
+          '<button class="btn sm" data-srcrows="' + esc(x.id) + '">Строки</button> ' +
+          '<button class="btn sm" data-srcedit="' + esc(x.id) + '">Изменить</button></td></tr>';
+      }).join('') : '<tr><td colspan="6" class="empty">Источников пока нет — нажмите «+ Источник». Старые подключения перенесены сюда автоматически.</td></tr>') + '</tbody>';
+  }
+  $('srcAdd').onclick = function () { openSourceModal(null); };
+  $('srcTable').onclick = function (e) {
+    var t = e.target.closest('[data-srctest]'), f = e.target.closest('[data-srcfields]'),
+        r = e.target.closest('[data-srcrows]'), ed = e.target.closest('[data-srcedit]');
+    if (t) srcCheck(t.dataset.srctest);
+    else if (f) srcShowFields(f.dataset.srcfields);
+    else if (r) srcShowRows(r.dataset.srcrows);
+    else if (ed) openSourceModal(srcById(ed.dataset.srcedit));
   };
-  function openOdataConn(x) {
-    OD.editing = x ? x.id : '';
-    $('odmName').value = x ? x.name : ''; $('odmBase').value = x ? x.base : ''; $('odmEntity').value = x ? (x.entity || '') : '';
-    $('odmLogin').value = x ? (x.login || '') : ''; $('odmPass').value = '';
-    $('odmPassHint').textContent = x && x.has_password ? 'пароль сохранён — оставьте пустым, чтобы не менять' : '';
-    $('odmFilter').value = x ? (x.filter || '') : ''; $('odmOrderby').value = x ? (x.orderby || '') : '';
-    $('odmTop').value = x ? (x.top || 50) : 50;
-    $('odmEnabled').checked = x ? !!x.enabled : true; $('odmIgnoreCert').checked = !!(x && x.ignore_cert);
-    $('odmDelete').style.display = x ? '' : 'none'; $('odmDelete').dataset.confirm = ''; $('odmDelete').textContent = 'Удалить подключение';
-    warnIn('odmWarn', ''); openModal('odm');
+  function srcTransportSet(t) {
+    SRC.transport = t;
+    Array.prototype.forEach.call($('srcmTransport').querySelectorAll('[data-tr]'), function (b) {
+      b.setAttribute('aria-pressed', b.dataset.tr === t ? 'true' : 'false'); });
+    Array.prototype.forEach.call(document.querySelectorAll('#srcm .tr-block'), function (blk) {
+      blk.hidden = blk.dataset.for !== t; });
+    $('srcmTrHint').textContent = TR_HINT[t] || '';
+    var pwHint = SRC.editing && (srcById(SRC.editing) || {}).has_password ? 'секрет сохранён — оставьте пустым, чтобы не менять' : '';
+    $('srcmPassHint').textContent = t === 'odata' ? pwHint : '';
+    $('srcmTokenHint').textContent = t === 'mcp' ? pwHint : '';
   }
-  $('odmSave').onclick = function () {
-    var d = { id: OD.editing, name: $('odmName').value.trim(), base: $('odmBase').value.trim(), entity: $('odmEntity').value.trim(),
-      login: $('odmLogin').value.trim(), password: $('odmPass').value, filter: $('odmFilter').value.trim(),
-      orderby: $('odmOrderby').value.trim(), top: +$('odmTop').value || 50, enabled: $('odmEnabled').checked, ignore_cert: $('odmIgnoreCert').checked };
-    api('/api/odata/save', d).then(function (res) {
-      if (!res.ok) { warnIn('odmWarn', 'err', esc(res.message)); return; }
-      closeModal('odm'); toast('Подключение сохранено'); loadOdata();
-      if (OD.id === res.item.id) odataOpenQuery(res.item.id);
+  $('srcmTransport').onclick = function (e) { var b = e.target.closest('[data-tr]'); if (b) srcTransportSet(b.dataset.tr); };
+  function openSourceModal(x) {
+    SRC.editing = x ? x.id : '';
+    var p = (x && x.params) || {};
+    $('srcmName').value = x ? x.name : '';
+    // odata
+    $('srcmBase').value = p.base || ''; $('srcmEntity').value = p.entity || ''; $('srcmTop').value = p.top || 50;
+    $('srcmLogin').value = p.login || ''; $('srcmPass').value = '';
+    $('srcmFilter').value = p.filter || ''; $('srcmOrderby').value = p.orderby || ''; $('srcmIgnoreCert').checked = !!p.ignore_cert;
+    // mcp
+    $('srcmProxy').value = p.proxy_url || ''; $('srcmAuth').value = p.auth || 'none'; $('srcmToken').value = '';
+    $('srcmToolMeta').value = p.tool_meta || 'get_metadata_structure'; $('srcmToolData').value = p.tool_data || '';
+    $('srcmMetaObj').value = p.metadata_object || ''; $('srcmArgs').value = p.args_template || ''; $('srcmWm').value = p.watermark_field || '';
+    $('srcmTools').textContent = x && x.last_check && x.last_check.tools ? 'инструменты MCP: ' + x.last_check.tools.slice(0, 12).join(', ') : '';
+    $('srcmEnabled').checked = x ? !!x.enabled : true;
+    $('srcmTitle').textContent = x ? 'Источник: ' + x.name : 'Новый источник данных 1С';
+    $('srcmSub').textContent = x ? ('id ' + x.id) : '';
+    $('srcmDelete').style.display = x ? '' : 'none'; $('srcmDelete').dataset.confirm = ''; $('srcmDelete').textContent = 'Удалить источник';
+    srcTransportSet(x && x.transport !== 'com' ? x.transport : 'odata');
+    if (x && x.transport === 'com') warnIn('srcmWarn', 'err', 'Транспорт прямого COM удалён из панели (работал только на Windows). Сохранение переключит источник на выбранный транспорт (OData/MCP) с новыми параметрами.');
+    else warnIn('srcmWarn', '');
+    openModal('srcm');
+  }
+  function srcFormData() {
+    var t = SRC.transport, params = {};
+    if (t === 'odata') params = { base: $('srcmBase').value.trim(), entity: $('srcmEntity').value.trim(), top: +$('srcmTop').value || 50,
+      login: $('srcmLogin').value.trim(), password: $('srcmPass').value, filter: $('srcmFilter').value.trim(),
+      orderby: $('srcmOrderby').value.trim(), ignore_cert: $('srcmIgnoreCert').checked };
+    else params = { proxy_url: $('srcmProxy').value.trim(), auth: $('srcmAuth').value, password: $('srcmToken').value,
+      tool_meta: $('srcmToolMeta').value.trim(), tool_data: $('srcmToolData').value.trim(), metadata_object: $('srcmMetaObj').value.trim(),
+      args_template: $('srcmArgs').value.trim(), watermark_field: $('srcmWm').value.trim() };
+    return { id: SRC.editing, name: $('srcmName').value.trim(), transport: t, params: params, enabled: $('srcmEnabled').checked };
+  }
+  $('srcmSave').onclick = function () {
+    api('/api/src/save', srcFormData()).then(function (res) {
+      if (!res.ok) { warnIn('srcmWarn', 'err', esc(res.message)); return; }
+      closeModal('srcm'); toast('Источник сохранён'); loadSources();
     });
   };
-  $('odmDelete').onclick = function () {
-    if (this.dataset.confirm !== OD.editing) { this.dataset.confirm = OD.editing; this.textContent = 'Точно удалить?'; return; }
-    api('/api/odata/delete', { id: OD.editing }).then(function (res) {
-      if (!res.ok) { warnIn('odmWarn', 'err', esc(res.message)); return; }
-      closeModal('odm'); toast('Подключение удалено');
-      if (OD.id === OD.editing) { OD.id = ''; $('odQueryCard').hidden = true; }
-      loadOdata();
+  $('srcmDelete').onclick = function () {
+    if (this.dataset.confirm !== SRC.editing) { this.dataset.confirm = SRC.editing; this.textContent = 'Точно удалить?'; return; }
+    api('/api/src/delete', { id: SRC.editing }).then(function (res) {
+      if (!res.ok) { warnIn('srcmWarn', 'err', esc(res.message)); return; }
+      closeModal('srcm'); toast('Источник удалён'); loadSources();
     });
   };
-  function odataTest(id) {
-    warnIn('odListWarn', '', 'Проверяю соединение с «' + esc((odConn(id) || {}).name || '') + '»…');
-    api('/api/odata/test', { id: id }).then(function (res) {
-      if (!res.ok) { warnIn('odListWarn', 'err', esc(res.message)); return; }
-      warnIn('odListWarn', '', '✓ ' + esc(res.message) + ' — можно выбирать таблицы в блоке «Запрос» ниже.');
+  $('srcmCheck').onclick = function () {
+    warnIn('srcmWarn', '', 'Сохраняю и проверяю соединение…');
+    api('/api/src/save', srcFormData()).then(function (res) {
+      if (!res.ok) { warnIn('srcmWarn', 'err', esc(res.message)); return; }
+      return api('/api/src/check', { id: res.item.id }).then(function (r) {
+        if (!r.ok) { warnIn('srcmWarn', 'err', esc(r.message)); return; }
+        warnIn('srcmWarn', r.ok ? '' : 'err', (r.ok ? '✓ ' : '✕ ') + esc(r.message || ''));
+        if (r.ok && r.tools) $('srcmTools').textContent = 'инструменты MCP: ' + r.tools.slice(0, 12).join(', ');
+        loadSources();
+      });
+    });
+  };
+  function srcCheck(id) {
+    warnIn('srcListWarn', '', 'Проверяю «' + esc((srcById(id) || {}).name || '') + '»…');
+    api('/api/src/check', { id: id }).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message)); return; }
+      warnIn('srcListWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || '')); loadSources();
     });
   }
-  function odataOpenQuery(id) {
-    var x = odConn(id); if (!x) return;
-    OD.id = id; OD.skip = 0; OD.entities = {};
-    $('odQueryCard').hidden = false; $('odConnName').textContent = '— ' + x.name + ' (' + x.base + ')';
-    $('odFilter').value = x.filter || ''; $('odOrderby').value = x.orderby || ''; $('odTop').value = x.top || 50;
-    $('odResult').innerHTML = '<tbody><tr><td class="empty">читаю список таблиц из $metadata…</td></tr></tbody>';
-    $('odInfo').textContent = ''; warnIn('odWarn', '');
-    api('/api/odata/entities', { id: id }).then(function (res) {
-      if (!res.ok) { $('odResult').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message) + '</td></tr></tbody>'; return; }
-      OD.entities = {};
-      (res.entities || []).forEach(function (s) { OD.entities[s.name] = s; });
-      var names = (res.entities || []).map(function (s) { return s.name; });
-      $('odEntity').innerHTML = names.map(function (n) { return '<option' + (n === x.entity ? ' selected' : '') + '>' + esc(n) + '</option>'; }).join('') || '<option value="">(нет наборов данных)</option>';
-      if (!names.length) $('odResult').innerHTML = '<tbody><tr><td class="empty">$metadata не вернул ни одного набора данных — опубликуйте OData в 1С.</td></tr></tbody>';
-      else if (x.entity) odataRun();
+  function srcShowFields(id) {
+    warnIn('srcListWarn', '', 'Читаю поля источника…');
+    api('/api/src/fields', { id: id }).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message)); return; }
+      warnIn('srcListWarn', '', '✓ полей: ' + res.fields.length + ' — ' + esc(res.fields.slice(0, 40).map(function (f) { return f.label || f.name; }).join(', ')));
+      loadSources();
     });
   }
-  function odataParams(skip) {
-    return { id: OD.id, entity: $('odEntity').value, filter: $('odFilter').value.trim(), orderby: $('odOrderby').value.trim(),
-      top: +$('odTop').value || 50, skip: skip || 0 };
-  }
-  function odataRun() {
-    if (!OD.id) return;
-    OD.skip = Math.max(0, +$('odTop').value || 50) > 0 && this && this.btn === 'next' ? OD.skip + (+$('odTop').value || 50) : (this && this.btn === 'prev' ? Math.max(0, OD.skip - (+$('odTop').value || 50)) : 0);
-    $('odResult').innerHTML = '<tbody><tr><td class="empty">запрос к 1С…</td></tr></tbody>';
-    warnIn('odWarn', '');
-    api('/api/odata/query', odataParams(OD.skip)).then(function (res) {
-      if (!res.ok) { $('odResult').innerHTML = '<tbody></tbody>'; warnIn('odWarn', 'err', esc(res.message)); return; }
-      OD.columns = res.columns || []; OD.rows = res.rows || []; OD.total = res.total || 0; OD.entity = res.entity;
-      var shown = OD.columns.slice(0, 24);
-      $('odResult').innerHTML = '<thead><tr>' + shown.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
-        (OD.rows.length ? OD.rows.slice(0, 500).map(function (r) {
-          return '<tr>' + shown.map(function (c) { return '<td class="l">' + esc(r[OD.columns.indexOf(c)]) + '</td>'; }).join('') + '</tr>';
-        }).join('') : '<tr><td colspan="' + Math.max(1, shown.length) + '" class="empty">нет строк по этому фильтру</td></tr>') + '</tbody>';
-      $('odInfo').textContent = 'строк на странице: ' + OD.rows.length + (OD.total ? ' · всего по оценке: ' + OD.total : '') +
-        (OD.columns.length > 24 ? ' · колонок: ' + OD.columns.length + ', показаны первые 24' : '');
+  function srcShowRows(id) {
+    warnIn('srcListWarn', '', 'Читаю строки источника…');
+    api('/api/src/rows', { id: id, top: 5 }).then(function (res) {
+      if (!res.ok) { warnIn('srcListWarn', 'err', esc(res.message)); return; }
+      var cols = (res.columns || []).slice(0, 10);
+      warnIn('srcListWarn', '', '✓ колонок: ' + (res.columns || []).length + ', строк: ' + (res.rows || []).length + (res.total ? ' (всего ~' + res.total + ')' : '') +
+        '<div class="tablewrap" style="margin-top:6px"><table class="at"><thead><tr>' + cols.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') +
+        '</tr></thead><tbody>' + (res.rows || []).slice(0, 5).map(function (r) {
+          return '<tr>' + cols.map(function (c) {
+            var ix = (res.columns || []).indexOf(c);
+            return '<td class="l">' + esc(String(r[ix] == null ? '' : r[ix])).slice(0, 60) + '</td>'; }).join('') + '</tr>';
+        }).join('') + '</tbody></table></div>');
     });
   }
-  $('odRun').onclick = function () { odataRun.call({}); };
-  $('odPrev').onclick = function () { var t = +$('odTop').value || 50; OD.skip = Math.max(0, OD.skip - t); odataParamsRender(); };
-  $('odNext').onclick = function () { var t = +$('odTop').value || 50; OD.skip = OD.skip + t; odataParamsRender(); };
-  function odataParamsRender() {
-    $('odResult').innerHTML = '<tbody><tr><td class="empty">запрос к 1С…</td></tr></tbody>';
-    api('/api/odata/query', odataParams(OD.skip)).then(function (res) {
-      if (!res.ok) { warnIn('odWarn', 'err', esc(res.message)); $('odResult').innerHTML = '<tbody></tbody>'; return; }
-      OD.columns = res.columns || []; OD.rows = res.rows || []; OD.total = res.total || 0;
-      var shown = OD.columns.slice(0, 24);
-      $('odResult').innerHTML = '<thead><tr>' + shown.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
-        (OD.rows.length ? OD.rows.slice(0, 500).map(function (r) {
-          return '<tr>' + shown.map(function (c) { return '<td class="l">' + esc(r[OD.columns.indexOf(c)]) + '</td>'; }).join('') + '</tr>';
-        }).join('') : '<tr><td colspan="' + Math.max(1, shown.length) + '" class="empty">нет строк</td></tr>') + '</tbody>' +
-        '<caption class="muted">страница: skip=' + OD.skip + ' · строка с ' + (OD.skip + 1) + '</caption>';
-      $('odInfo').textContent = 'строк на странице: ' + OD.rows.length + (OD.total ? ' · всего по оценке: ' + OD.total : '');
+
+  // =====================================================================
+  // СОПОСТАВЛЕНИЕ РЕКВИЗИТОВ 1С ↔ РЕЕСТР И СИНХРОНИЗАЦИЯ — только админ
+  // =====================================================================
+  var SYNC = { maps: [], sources: [], log: [], columns: [], fields: [], pairs: {}, editing: '', lastEntry: null };
+  function loadSync() {
+    if (!(AUTH.user && AUTH.user.admin)) return;
+    api('/api/sync/maps', {}).then(function (res) {
+      if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message || 'Нет доступа')); return; }
+      SYNC.maps = res.items || []; SYNC.sources = res.sources || []; SYNC.log = res.log || [];
+      renderMapTable(); renderSyncLog();
     });
   }
-  $('odXlsx').onclick = function () {
-    if (!OD.id) return;
-    api('/api/odata/xlsx', odataParams(0)).then(function (res) {
-      if (!res.ok) { warnIn('odWarn', 'err', esc(res.message)); return; }
+  function syncMapById(id) { return SYNC.maps.filter(function (x) { return x.id === id; })[0] || null; }
+  function renderMapTable() {
+    $('mapTable').innerHTML = '<thead><tr><th>Название</th><th>Источник</th><th>Реестр года</th><th>Пар сопоставления</th><th>Режим</th><th>Watermark</th><th></th></tr></thead><tbody>' +
+      (SYNC.maps.length ? SYNC.maps.map(function (m) {
+        var s = srcById(m.source) || {};
+        return '<tr><td class="l"><b>' + esc(m.name) + '</b>' + (m.enabled === false ? ' <span class="pill warn">выкл</span>' : '') + '</td>' +
+          '<td>' + esc(s.name || '(источник удалён)') + '</td><td>' + esc(m.year || '—') + '</td>' +
+          '<td>' + Object.keys(m.map || {}).length + '</td>' +
+          '<td>' + (m.mode === 'auto' ? '<span class="pill ok">авто</span>' : 'ручной') + '</td>' +
+          '<td class="l muted">' + esc((m.watermark_field || '—') + (m.last_watermark ? ' · до ' + String(m.last_watermark).slice(0, 19) : '')) + '</td>' +
+          '<td style="white-space:nowrap"><button class="btn sm" data-mapdry="' + esc(m.id) + '">Предпросмотр</button> ' +
+          '<button class="btn sm primary" data-mapsync="' + esc(m.id) + '">Синхронизировать</button> ' +
+          '<button class="btn sm" data-mapedit="' + esc(m.id) + '">Изменить</button> ' +
+          '<button class="btn sm" data-mapdel="' + esc(m.id) + '">✕</button></td></tr>';
+      }).join('') : '<tr><td colspan="7" class="empty">Сопоставлений пока нет — нажмите «+ Сопоставление», выберите источник и свяжите поля 1С с колонками реестра.</td></tr>') + '</tbody>';
+  }
+  function renderSyncLog() {
+    $('syncLog').innerHTML = '<thead><tr><th>Когда</th><th>Сопоставление</th><th>Режим</th><th>Прочитано</th><th>Совпало</th><th>Изменено</th><th>Пропущено</th><th>Ошибки</th></tr></thead><tbody>' +
+      (SYNC.log.length ? SYNC.log.map(function (e) {
+        return '<tr><td class="muted">' + esc((e.at || '').replace('T', ' ')) + '</td><td class="l">' + esc(e.mapping || '') + '</td>' +
+          '<td>' + (e.dry ? 'предпросмотр' : 'запись') + '</td><td>' + (e.read || 0) + '</td><td>' + (e.matched || 0) + '</td>' +
+          '<td>' + (e.changed || 0) + '</td><td>' + (e.skipped || 0) + '</td>' +
+          '<td>' + (e.errors && e.errors.length ? '<span class="pill warn">' + e.errors.length + '</span> <span class="muted">' + esc(String(e.errors[0])).slice(0, 80) + '</span>' : '—') + '</td></tr>';
+      }).join('') : '<tr><td colspan="8" class="empty">Прогонов ещё не было.</td></tr>') + '</tbody>';
+  }
+  $('mapAdd').onclick = function () { openMapModal(null); };
+  $('mapTable').onclick = function (e) {
+    var d = e.target.closest('[data-mapdry]'), s = e.target.closest('[data-mapsync]'),
+        ed = e.target.closest('[data-mapedit]'), del = e.target.closest('[data-mapdel]');
+    if (d) runSync(d.dataset.mapdry, true);
+    else if (s) runSync(s.dataset.mapsync, false);
+    else if (ed) openMapModal(syncMapById(ed.dataset.mapedit));
+    else if (del) {
+      var m = syncMapById(del.dataset.mapdel); if (!m) return;
+      if (del.dataset.confirm !== m.id) { del.dataset.confirm = m.id; del.textContent = 'Точно?'; return; }
+      api('/api/sync/delete', { id: m.id }).then(function (res) {
+        if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
+        toast('Сопоставление удалено'); loadSync();
+      });
+    }
+  };
+  function mapSelFill(sel, items, cur, blankLabel) {
+    sel.innerHTML = '<option value="">' + blankLabel + '</option>' +
+      items.map(function (x) { return '<option value="' + esc(x.name) + '"' + (x.name === cur ? ' selected' : '') + '>' + esc(x.label || x.name) + '</option>'; }).join('');
+  }
+  function openMapModal(m) {
+    SYNC.editing = m ? m.id : '';
+    $('mapmTitle').textContent = m ? 'Сопоставление: ' + m.name : 'Новое сопоставление реквизитов';
+    $('mapmName').value = m ? m.name : '';
+    $('mapmSource').innerHTML = '<option value="">— выберите источник —</option>' +
+      SYNC.sources.map(function (x) { return '<option value="' + esc(x.id) + '"' + (m && m.source === x.id ? ' selected' : '') + '>' + esc(x.name) + ' · ' + (TR_NAME[x.transport] || x.transport) + '</option>'; }).join('');
+    var ys = yearsList();
+    $('mapmYear').innerHTML = ys.map(function (y) { return '<option' + (String(y.year) === String(m && m.year) ? ' selected' : '') + '>' + y.year + '</option>'; }).join('');
+    $('mapmMode').value = m && m.mode === 'auto' ? 'auto' : 'manual';
+    $('mapmEnabled').checked = m ? m.enabled !== false : true;
+    SYNC.fields = []; SYNC.columns = []; SYNC.pairs = m ? (m.map || {}) : {};
+    $('mapmGuid').innerHTML = '<option value="">авто (RefKey / ID)</option>';
+    $('mapmNumber').innerHTML = '<option value="">— не задано —</option>';
+    $('mapmWm').innerHTML = '<option value="">— без watermark —</option>';
+    $('mapmBindGuid').value = ''; $('mapmBindNum').value = '';
+    $('mapmPreviewWrap').hidden = true;
+    renderPairsTable();
+    warnIn('mapmWarn', ''); openModal('mapm');
+    if (m && m.source) mapLoadCols();
+  }
+  $('mapmSource').onchange = function () { mapLoadCols(); };
+  $('mapmYear').onchange = function () { mapLoadCols(); };
+  function mapLoadCols() {
+    var sid = $('mapmSource').value;
+    if (!sid) { warnIn('mapmWarn', 'err', 'Выберите источник'); return; }
+    warnIn('mapmWarn', '', 'Читаю поля источника и колонки реестра…');
+    Promise.all([api('/api/sync/fields', { source: sid }), api('/api/sync/columns', { year: $('mapmYear').value })]).then(function (rs) {
+      var rf = rs[0], rc = rs[1];
+      if (!rf.ok) { warnIn('mapmWarn', 'err', esc(rf.message)); return; }
+      if (!rc.ok) { warnIn('mapmWarn', 'err', esc(rc.message)); return; }
+      SYNC.fields = rf.fields || []; SYNC.columns = rc.columns || [];
+      warnIn('mapmWarn', '', '✓ полей 1С: ' + SYNC.fields.length + ' · колонок реестра: ' + SYNC.columns.length);
+      mapSelFill($('mapmGuid'), SYNC.fields, ($('mapmGuid').options[$('mapmGuid').selectedIndex] || {}).value || '', 'авто (RefKey / ID)');
+      mapSelFill($('mapmNumber'), SYNC.fields, $('mapmNumber').value, '— не задано —');
+      mapSelFill($('mapmWm'), SYNC.fields, $('mapmWm').value, '— без watermark —');
+      renderPairsTable();
+    });
+  }
+  function renderPairsTable() {
+    var pairs = SYNC.pairs || {};
+    var names = Object.keys(pairs);
+    if (!names.length && SYNC.fields.length) names = SYNC.fields.map(function (f) { return f.name; });
+    $('mapmPairsInfo').textContent = 'сопоставлено пар: ' + Object.keys(pairs).length + (SYNC.fields.length ? ' из ' + SYNC.fields.length + ' полей' : '');
+    $('mapmPairs').innerHTML = '<thead><tr><th class="l">Поле источника 1С</th><th>→ Колонка реестра Панели</th><th></th></tr></thead><tbody>' +
+      (names.length ? names.map(function (fn) {
+        var fld = SYNC.fields.filter(function (f) { return f.name === fn; })[0];
+        return '<tr><td class="l">' + esc((fld && fld.label) || fn) + ' <span class="muted">' + esc(fn) + '</span></td>' +
+          '<td><select data-pair="' + esc(fn) + '"><option value="">— не сопоставлять —</option>' +
+          SYNC.columns.map(function (c) { return '<option' + (pairs[fn] === c.header ? ' selected' : '') + '>' + esc(c.header) + '</option>'; }).join('') +
+          '</select></td><td><button class="btn sm" data-pdrop="' + esc(fn) + '" title="Убрать поле из сопоставления">✕</button></td></tr>';
+      }).join('') : '<tr><td colspan="3" class="empty">нет полей — выберите источник</td></tr>') + '</tbody>';
+  }
+  $('mapmPairs').onchange = function (e) {
+    var s = e.target.closest('[data-pair]'); if (!s) return;
+    if (s.value) SYNC.pairs[s.dataset.pair] = s.value; else delete SYNC.pairs[s.dataset.pair];
+    $('mapmPairsInfo').textContent = 'сопоставлено пар: ' + Object.keys(SYNC.pairs).length;
+  };
+  $('mapmPairs').onclick = function (e) {
+    var b = e.target.closest('[data-pdrop]'); if (!b) return;
+    delete SYNC.pairs[b.dataset.pdrop]; renderPairsTable();
+  };
+  $('mapmSuggest').onclick = function () {
+    var sid = $('mapmSource').value;
+    if (!sid) { warnIn('mapmWarn', 'err', 'Сначала выберите источник'); return; }
+    warnIn('mapmWarn', '', 'Подбираю пары по названиям…');
+    api('/api/sync/suggest', { source: sid, year: $('mapmYear').value }).then(function (res) {
+      if (!res.ok) { warnIn('mapmWarn', 'err', esc(res.message)); return; }
+      (res.pairs || []).forEach(function (pr) { SYNC.pairs[pr.src] = pr.dst; });
+      renderPairsTable();
+      warnIn('mapmWarn', '', '✓ подобрано пар: ' + (res.pairs || []).length + ' — проверьте и при необходимости поправьте вручную');
+    });
+  };
+  $('mapmBindBtn').onclick = function () {
+    var g = $('mapmBindGuid').value.trim(), n = $('mapmBindNum').value.trim();
+    if (!g || !n) { warnIn('mapmWarn', 'err', 'Заполните GUID и номер закупки'); return; }
+    api('/api/sync/bind', { guid: g, number: n }).then(function (res) {
+      warnIn('mapmWarn', res.ok ? '' : 'err', res.ok ? '✓ соответствие GUID ↔ номер сохранено' : esc(res.message));
+    });
+  };
+  $('mapmPreview').onclick = function () {
+    var sid = $('mapmSource').value;
+    if (!sid) { warnIn('mapmWarn', 'err', 'Сначала выберите источник'); return; }
+    $('mapmPreviewWrap').hidden = false;
+    $('mapmPreviewTbl').innerHTML = '<tbody><tr><td class="empty">запрос к источнику…</td></tr></tbody>';
+    api('/api/src/rows', { id: sid, top: 10 }).then(function (res) {
+      if (!res.ok) { $('mapmPreviewTbl').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message) + '</td></tr></tbody>'; return; }
+      var cols = (res.columns || []).slice(0, 12);
+      $('mapmPreviewTbl').innerHTML = '<thead><tr>' + cols.map(function (c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>' +
+        (res.rows || []).map(function (r) {
+          return '<tr>' + cols.map(function (c) {
+            var v = String(r[(res.columns || []).indexOf(c)] == null ? '' : r[(res.columns || []).indexOf(c)]);
+            var isGuid = /^[0-9a-fA-F]{8}-/.test(v) && v.length > 30;
+            return '<td class="l"' + (isGuid ? ' data-bindguid="' + esc(v) + '" style="cursor:pointer" title="Кликните, чтобы подставить в поле GUID привязки"' : '') + '>' + esc(v).slice(0, 40) + '</td>';
+          }).join('') + '</tr>';
+        }).join('') + '</tbody>';
+    });
+  };
+  $('mapmPreviewTbl').onclick = function (e) {
+    var td = e.target.closest('[data-bindguid]');
+    if (td) { $('mapmBindGuid').value = td.dataset.bindguid; $('mapmBindNum').focus(); }
+  };
+  $('mapmSave').onclick = function () {
+    var mapping = { id: SYNC.editing, name: $('mapmName').value.trim(), source: $('mapmSource').value, year: $('mapmYear').value,
+      mode: $('mapmMode').value, enabled: $('mapmEnabled').checked, guid_field: $('mapmGuid').value,
+      number_field: $('mapmNumber').value, watermark_field: $('mapmWm').value, map: SYNC.pairs || {} };
+    api('/api/sync/save', { mapping: mapping }).then(function (res) {
+      if (!res.ok) { warnIn('mapmWarn', 'err', esc(res.message)); return; }
+      closeModal('mapm'); toast('Сопоставление сохранено'); loadSync();
+    });
+  };
+  function runSync(id, dry) {
+    if (!id) return;
+    warnIn('syncWarn', '', dry ? 'Выполняю предпросмотр (без записи)…' : 'Синхронизирую…');
+    api('/api/sync/run', { id: id, dry: !!dry }).then(function (res) {
+      if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
+      var e = res.entry;
+      if (dry) { SYNC.lastEntry = e; showDryRun(e); }
+      else {
+        warnIn('syncWarn', e.errors && e.errors.length ? 'err' : '',
+          (e.errors && e.errors.length ? '⚠ ' : '✓ ') + 'прогон: прочитано ' + e.read + ', совпало ' + e.matched + ', изменено ' + e.changed + ', пропущено ' + e.skipped +
+          (e.errors && e.errors.length ? ' · ошибок: ' + e.errors.length + ' — ' + esc(String(e.errors[0])).slice(0, 120) : ''));
+        loadSync();
+      }
+    });
+  }
+  function showDryRun(e) {
+    $('syncpSub').textContent = e.mapping + ' · ' + (e.at || '').replace('T', ' ');
+    var err = e.errors || [];
+    warnIn('syncpWarn', err.length ? 'warn' : '', err.length ? 'Замечания: ' + err.slice(0, 5).map(esc).join('<br>') : 'Ошибок нет — можно применять.');
+    $('syncpBody').innerHTML = '<div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:10px">' +
+      ['прочитано: ' + e.read, 'строк реестра найдено: ' + e.matched, 'ячеек изменится: ' + e.changed, 'пропущено: ' + e.skipped].map(function (t) {
+        return '<span class="pill">' + esc(t) + '</span>'; }).join(' ') + '</div>' +
+      '<span class="muted">предпросмотр ничего не менял; кнопка «Применить» выполнит тот же прогон с записью в реестр.</span>';
+    openModal('syncp');
+  }
+  $('syncpApply').onclick = function () {
+    if (!SYNC.lastEntry) return;
+    var m = SYNC.maps.filter(function (x) { return x.name === SYNC.lastEntry.mapping; })[0];
+    closeModal('syncp');
+    runSync(m ? m.id : '', false);
+  };
+  $('syncExport').onclick = function () {
+    api('/api/sync/export', {}).then(function (res) {
+      if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
       var a = document.createElement('a');
-      a.href = 'data:xlsx;base64,' + res.file_b64; a.download = res.name || '1С-OData.xlsx';
+      a.href = 'data:application/json;base64,' + res.file_b64; a.download = res.name || 'Сопоставления 1С.json';
       document.body.appendChild(a); a.click(); a.remove();
-      toast('Выгружено строк: ' + res.rows);
+      toast('Экспортировано сопоставлений: ' + res.count);
     });
   };
-  $('odEntity').onchange = function () {
-    var s = OD.entities[this.value];
-    $('odFilter').placeholder = s && s.props && s.props.length ? 'поля: ' + s.props.slice(0, 30).map(function (p) { return p.name; }).join(', ') : 'например, СуммаДокумента gt 100000';
+  $('syncImportFile').onchange = function () {
+    var f = this.files && this.files[0]; if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function () {
+      var b64 = String(rd.result || '').split(',').pop();
+      api('/api/sync/import', { file_b64: b64 }).then(function (res) {
+        if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message)); return; }
+        warnIn('syncWarn', '', '✓ импорт: добавлено ' + res.added + ', пропущено ' + res.skipped + ' (источник не найден или файл неполный)');
+        loadSync();
+      });
+    };
+    rd.readAsDataURL(f);
+    this.value = '';
   };
 
-  // --- Подключение к 1С без веб-публикации (COM) — Администрирование, только администратор ---
-  var C1 = { list: [], editing: '' };
-  function c1Conn(id) { return C1.list.filter(function (x) { return x.id === id; })[0] || null; }
-  function loadC1() {
+  // =====================================================================
+  // РАСПИСАНИЕ АВТО-СИНХРОНИЗАЦИИ — только админ
+  // =====================================================================
+  function loadSch() {
     if (!(AUTH.user && AUTH.user.admin)) return;
-    api('/api/c1/list', {}).then(function (res) {
-      if (!res.ok) { $('c1Table').innerHTML = '<tbody><tr><td class="empty">' + esc(res.message || 'Нет доступа') + '</td></tr></tbody>'; return; }
-      C1.list = res.items || [];
-      $('c1ModeHint').textContent = res.com
-        ? 'Прямой запуск 1С доступен: на сервере панели есть pywin32 и установлена платформа 1С.'
-        : (res.windows
-          ? 'На сервере панели не установлен pywin32 (pip install pywin32) — прямой запуск 1С недоступен. Параметры можно завести заранее.'
-          : 'Панель работает не на Windows — прямой COM-запуск 1С недоступен, используйте подключения OData. Параметры можно завести заранее.');
-      renderC1Conns();
+    api('/api/sync/maps', {}).then(function (res) {
+      if (!res.ok) { warnIn('schWarn', 'err', esc(res.message || 'Нет доступа')); return; }
+      var s = res.settings || {};
+      $('schEnabled').checked = !!s.enabled;
+      $('schInterval').value = s.interval_min || 60;
+      $('schFrom').value = s.hours_from != null ? s.hours_from : 8;
+      $('schTo').value = s.hours_to != null ? s.hours_to : 20;
+      var wd = s.weekdays || [];
+      Array.prototype.forEach.call($('schDays').querySelectorAll('input'), function (cb) { cb.checked = wd.indexOf(+cb.value) >= 0; });
+      $('schLast').textContent = 'Последний автопрогон: ' + (s.last_run ? String(s.last_run).replace('T', ' ') : 'ещё не выполнялся') +
+        ' · записей в журнале: ' + (res.log || []).length;
+      warnIn('schWarn', '');
     });
   }
-  function renderC1Conns() {
-    $('c1Table').innerHTML = '<thead><tr><th>Название</th><th>Строка соединения</th><th>Модуль.Метод</th><th>Доступ</th><th>Статус</th><th></th></tr></thead><tbody>' +
-      (C1.list.length ? C1.list.map(function (x) {
-        return '<tr><td class="l"><b>' + esc(x.name) + '</b></td><td class="l">' + esc(x.connect || '—') + '</td>' +
-          '<td>' + (x.module ? esc(x.module) + (x.method ? '.' + esc(x.method) : '') : '—') + '</td>' +
-          '<td>' + (x.user ? esc(x.user) : '—') + (x.has_password ? ' <span class="pill ok">пароль задан</span>' : '') + '</td>' +
-          '<td>' + (x.enabled ? '<span class="pill ok">включено</span>' : '<span class="pill warn">выключено</span>') +
-            (x.last_check ? '<br><span class="muted">' + (x.last_check.ok ? '✓ ' : '✕ ') + esc((x.last_check.checked_at || '').replace('T', ' ')) + '</span>' : '') + '</td>' +
-          '<td style="white-space:nowrap"><button class="btn sm" data-c1test="' + esc(x.id) + '">Проверить</button> ' +
-          (x.module && x.method ? '<button class="btn sm primary" data-c1call="' + esc(x.id) + '">Вызвать</button> ' : '') +
-          '<button class="btn sm" data-c1edit="' + esc(x.id) + '">Изменить</button></td></tr>';
-      }).join('') : '<tr><td colspan="6" class="empty">Подключений пока нет — нажмите «+ Подключение».</td></tr>') + '</tbody>';
-  }
-  $('c1Add').onclick = function () { openC1Conn(null); };
-  $('c1Table').onclick = function (e) {
-    var t = e.target.closest('[data-c1test]'), cl = e.target.closest('[data-c1call]'), ed = e.target.closest('[data-c1edit]');
-    if (t) c1Test(t.dataset.c1test);
-    else if (cl) c1Call(cl.dataset.c1call);
-    else if (ed) openC1Conn(c1Conn(ed.dataset.c1edit));
-  };
-  function openC1Conn(x) {
-    C1.editing = x ? x.id : '';
-    $('c1mName').value = x ? x.name : ''; $('c1mConnect').value = x ? (x.connect || '') : '';
-    $('c1mServer').value = x ? (x.server || '') : ''; $('c1mBase').value = x ? (x.base || '') : '';
-    $('c1mUser').value = x ? (x.user || '') : ''; $('c1mPass').value = '';
-    $('c1mPassHint').textContent = x && x.has_password ? 'пароль сохранён — оставьте пустым, чтобы не менять' : '';
-    $('c1mModule').value = x ? (x.module || '') : ''; $('c1mMethod').value = x ? (x.method || '') : '';
-    $('c1mParam').value = x ? (x.param || '') : ''; $('c1mDesc').value = x ? (x.desc || '') : '';
-    $('c1mEnabled').checked = x ? !!x.enabled : true;
-    $('c1mDelete').style.display = x ? '' : 'none'; $('c1mDelete').dataset.confirm = ''; $('c1mDelete').textContent = 'Удалить подключение';
-    warnIn('c1mWarn', ''); openModal('c1m');
-  }
-  function c1FormData() {
-    return { id: C1.editing, name: $('c1mName').value.trim(), connect: $('c1mConnect').value.trim(),
-      server: $('c1mServer').value.trim(), base: $('c1mBase').value.trim(), user: $('c1mUser').value.trim(),
-      password: $('c1mPass').value, module: $('c1mModule').value.trim(), method: $('c1mMethod').value.trim(),
-      param: $('c1mParam').value, desc: $('c1mDesc').value.trim(), enabled: $('c1mEnabled').checked };
-  }
-  $('c1mSave').onclick = function () {
-    api('/api/c1/save', c1FormData()).then(function (res) {
-      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
-      closeModal('c1m'); toast('Подключение сохранено'); loadC1();
+  $('schSave').onclick = function () {
+    var wd = Array.prototype.filter.call($('schDays').querySelectorAll('input'), function (cb) { return cb.checked; }).map(function (cb) { return +cb.value; });
+    api('/api/sync/settings', { enabled: $('schEnabled').checked, interval_min: +$('schInterval').value || 60,
+      hours_from: +$('schFrom').value, hours_to: +$('schTo').value, weekdays: wd }).then(function (res) {
+      if (!res.ok) { warnIn('schWarn', 'err', esc(res.message)); return; }
+      warnIn('schWarn', '', '✓ расписание сохранено: каждые ' + res.settings.interval_min + ' мин, в окне ' + res.settings.hours_from + ':00–' + res.settings.hours_to + ':00, ' +
+        (res.settings.enabled ? 'включено' : 'выключено'));
+      toast('Расписание сохранено');
     });
   };
-  $('c1mDelete').onclick = function () {
-    if (this.dataset.confirm !== C1.editing) { this.dataset.confirm = C1.editing; this.textContent = 'Точно удалить?'; return; }
-    api('/api/c1/delete', { id: C1.editing }).then(function (res) {
-      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
-      closeModal('c1m'); toast('Подключение удалено'); loadC1();
-    });
-  };
-  $('c1mCheck').onclick = function () {
-    warnIn('c1mWarn', '', 'Проверяю подключение…');
-    api('/api/c1/check', c1FormData()).then(function (res) {
-      if (!res.ok) { warnIn('c1mWarn', 'err', esc(res.message)); return; }
-      warnIn('c1mWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || ''));
-    });
-  };
-  function c1Test(id) {
-    warnIn('c1ListWarn', '', 'Проверяю соединение с «' + esc((c1Conn(id) || {}).name || '') + '»…');
-    api('/api/c1/test', { id: id }).then(function (res) {
-      if (!res.ok) { warnIn('c1ListWarn', 'err', esc(res.message)); loadC1(); return; }
-      warnIn('c1ListWarn', res.ok ? '' : 'err', (res.ok ? '✓ ' : '✕ ') + esc(res.message || '')); loadC1();
-    });
-  }
-  function c1Call(id) {
-    var x = c1Conn(id); if (!x) return;
-    warnIn('c1ListWarn', '', 'Вызываю ' + esc(x.module || '') + '.' + esc(x.method || '') + ' в «' + esc(x.name) + '»…');
-    api('/api/c1/call', { id: id }).then(function (res) {
-      if (!res.ok) { warnIn('c1ListWarn', 'err', esc(res.message)); return; }
-      var txt = typeof res.result === 'string' ? res.result : JSON.stringify(res.result, null, 2);
-      warnIn('c1ListWarn', '', '✓ ответ 1С: ' + esc(String(txt == null ? '(пусто)' : txt).slice(0, 500)));
-    });
-  }
+
   // дополнительный член комиссии — только для этого протокола
   $('pm_extra_add').onclick = function () {
     $('pm_extra').insertAdjacentHTML('beforeend', '<div class="xrow"><select><option>Член комиссии</option><option>Заместитель председателя комиссии</option><option>Председатель комиссии</option><option>Секретарь комиссии</option></select>' +

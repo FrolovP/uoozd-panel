@@ -9,6 +9,5 @@ xlrd>=2.0.2
 PyMySQL>=1.1.0
 cryptography>=42.0.0
 
-# Прямое COM-подключение к 1С (V83.COMConnector) — только Windows,
-# на машине панели также нужна установленная платформа 1С той же разрядности
-pywin32>=306; platform_system == "Windows"
+# Панель кроссплатформенна: Windows / Linux / macOS (Python 3.10+, без win32-зависимостей).
+# Подключение к 1С — OData или MCP (python-прокси src/py_server + расширение mcp.cfe в базе).
