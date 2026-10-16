@@ -1686,15 +1686,15 @@ def odata_query(rec, entity=None, filt=None, orderby=None, top=None, skip=0):
     params = ['$format=json']
     f = str(filt if filt is not None else (rec.get('filter') or '')).strip()
     if f:
-        params.append('$filter=' + quote(f, safe="()<>!=~,'&|.:-+*/% "))
+        params.append('$filter=' + quote(f, safe="()<>!=~,'&|.:-+*/%"))
     ob = str(orderby if orderby is not None else (rec.get('orderby') or '')).strip()
     if ob:
-        params.append('$orderby=' + quote(ob, safe=',. -'))
+        params.append('$orderby=' + quote(ob, safe=',.-'))
     t = int(top if top else ODATA_PAGE)
     params.append('$top=' + str(max(1, min(t, ODATA_MAX_ROWS))))
     if skip:
         params.append('$skip=' + str(int(skip)))
-    j = _odata_http_get(rec['base'] + ent + '?' + '&'.join(params), rec)
+    j = _odata_http_get(rec['base'] + quote(ent, safe='') + '?' + '&'.join(params), rec)
     items = j.get('value') or []
     columns, seen = [], set()
     for it in items:
@@ -2244,6 +2244,324 @@ def src_api(path, data, user):
         return {'ok': True, 'tools': [{'name': x.get('name'), 'description': (x.get('description') or '')[:200]}
                                       for x in info.get('tools') or []]}
     raise ValueError('Нет такой команды источника 1С')
+
+
+# =====================================================================
+# ЗАГРУЗКА ДОКУМЕНТОВ ИЗ 1С — «внутренние документы» панели
+# Администратор выбирает тип документа (набор OData / объект метаданных MCP)
+# и период; панель читает строки постранично и складывает в хранилище
+# «Панель — документы 1С.json» с дедупликацией по GUID документа.
+# =====================================================================
+
+ФАЙЛ_ДОКУМЕНТЫ_1С = 'Панель — документы 1С.json'
+DOCS_PAGE = 500               # строк на страницу чтения из 1С
+DOCS_MAX = 5000               # максимум документов за одну загрузку
+
+_DOC_GUID_KEYS = ('Ref_Key', 'RefKey', 'GUID', 'Ссылка', 'ID', 'id')
+_DOC_NUM_KEYS = ('Number', 'Номер', 'number')
+_DOC_DATE_KEYS = ('Date', 'Дата', 'date')
+_DOC_POSTED_KEYS = ('Posted', 'Проведен', 'Проведён', 'posted')
+
+
+def docs_load_raw():
+    rows = _json_file(ФАЙЛ_ДОКУМЕНТЫ_1С, [])
+    return rows if isinstance(rows, list) else []
+
+
+def docs_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ДОКУМЕНТЫ_1С, json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def _doc_kind(set_name):
+    n = str(set_name or '')
+    if n.startswith('Document_'):
+        return 'документ'
+    if n.startswith('Catalog_'):
+        return 'справочник'
+    if n.startswith('InformationRegister_'):
+        return 'регистр сведений'
+    if n.startswith('AccumulationRegister_'):
+        return 'регистр накопления'
+    return 'набор данных'
+
+
+def _doc_guess_date_field(props):
+    names = [p.get('name') for p in props or [] if p.get('name')]
+    for want in ('Date', 'Дата'):
+        if want in names:
+            return want
+    for n in names:
+        if 'date' in n.lower() or 'дата' in n.lower():
+            return n
+    return ''
+
+
+def doc_types(rec):
+    """Типы документов источника → [{'name','label','kind','date_field'}]."""
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    if t == 'odata':
+        probe = {'base': p.get('base'), 'login': p.get('login'), 'password': p.get('password'),
+                 'ignore_cert': p.get('ignore_cert')}
+        sets = odata_service_info(probe)
+        return [{'name': s.get('name') or '', 'label': (s.get('name') or '').split('_', 1)[-1],
+                 'kind': _doc_kind(s.get('name')), 'date_field': _doc_guess_date_field(s.get('props'))}
+                for s in sets if s.get('name')]
+    if t == 'com':
+        raise ValueError('Транспорт прямого COM удалён из панели — пересоздайте источник на OData или MCP')
+    obj = str(p.get('metadata_object') or '').strip()
+    if not obj:
+        raise ValueError('Для источника MCP укажите объект метаданных — он и будет типом документа')
+    return [{'name': obj, 'label': obj, 'kind': 'документ', 'date_field': ''}]
+
+
+def _doc_pick(d, keys):
+    for k in keys:
+        if d.get(k) not in (None, ''):
+            return d.get(k)
+    return ''
+
+
+def _doc_date_iso(v):
+    """Дата из 1С (ISO или ДД.ММ.ГГГГ …) → 'YYYY-MM-DD' для фильтров и сортировки."""
+    s = str(v or '').strip()
+    m = re.match(r'^(\d{4}-\d{2}-\d{2})', s)
+    if m:
+        return m.group(1)
+    m = re.match(r'^(\d{2})\.(\d{2})\.(\d{4})', s)
+    if m:
+        return f'{m.group(3)}-{m.group(2)}-{m.group(1)}'
+    return ''
+
+
+def _doc_posted(v):
+    return str(v or '').strip().lower() in ('true', 'да', '1')
+
+
+def _doc_normalize(raw, rec, doc_type, actor_at):
+    guid = str(_doc_pick(raw, _DOC_GUID_KEYS) or '').strip()
+    number = str(_doc_pick(raw, _DOC_NUM_KEYS) or '').strip()
+    date_iso = _doc_date_iso(_doc_pick(raw, _DOC_DATE_KEYS))
+    uid = guid or f'{doc_type}/{number}/{date_iso}'
+    fields = {}
+    for k, v in list(raw.items())[:120]:
+        fields[str(k)] = str(v)[:500] if v is not None else ''
+    return {'uid': uid, 'source': rec.get('id'), 'doc_type': doc_type, 'number': number,
+            'date': date_iso, 'posted': _doc_posted(_doc_pick(raw, _DOC_POSTED_KEYS)),
+            'fields': fields, 'loaded_at': actor_at}
+
+
+def docs_fetch(rec, doc_type, date_from, date_to, date_field, limit=DOCS_MAX):
+    """Чтение документов одного типа за период → список словарей (сырые строки)."""
+    t = rec.get('transport')
+    p = rec.get('params') or {}
+    cap = max(1, min(int(limit or DOCS_MAX), DOCS_MAX))
+    if t == 'odata':
+        cond = []
+        if date_field and date_from:
+            cond.append(f"{date_field} ge datetime'{date_from}T00:00:00'")
+        if date_field and date_to:
+            cond.append(f"{date_field} le datetime'{date_to}T23:59:59'")
+        filt = ' and '.join(cond) or None
+        orderby = f'{date_field} desc' if date_field else None
+        out, skip = [], 0
+        while len(out) < cap:
+            q = odata_query(_src_odata_rec(rec), entity=doc_type, filt=filt, orderby=orderby,
+                            top=min(DOCS_PAGE, cap - len(out)), skip=skip)
+            batch = [dict(zip(q['columns'], r)) for r in q['rows']]
+            if not batch:
+                break
+            out.extend(batch)
+            if len(batch) < min(DOCS_PAGE, cap):
+                break
+            skip += len(batch)
+        return out
+    if t == 'com':
+        raise ValueError('Транспорт прямого COM удалён из панели — пересоздайте источник на OData или MCP')
+    args = {}
+    if date_from:
+        args['DateFrom'] = str(date_from)
+    if date_to:
+        args['DateTo'] = str(date_to)
+    if str(p.get('args_template') or '').strip():
+        try:
+            base_args = json.loads(p['args_template'])
+            if isinstance(base_args, dict):
+                args = {**base_args, **args}
+        except ValueError:
+            raise ValueError('Некорректный шаблон аргументов MCP — должен быть JSON-объект')
+    tbl = _as_table(mcp_tool_call(rec, p.get('tool_data'), args))
+    return [dict(zip(tbl['columns'], r)) for r in tbl['rows']][:cap]
+
+
+def docs_api(path, data, user):
+    """POST /api/docs/… — типы документов, загрузка за период, хранилище (только админ)."""
+    if not user.get('admin'):
+        raise PermissionError('Загрузка документов из 1С доступна только администратору')
+    if path == '/api/docs/types':
+        rec = src_find(str(data.get('source') or ''))
+        if not rec:
+            raise ValueError('Источник не найден')
+        return {'ok': True, 'types': doc_types(rec)}
+    if path == '/api/docs/type_fields':
+        rec = src_find(str(data.get('source') or ''))
+        if not rec:
+            raise ValueError('Источник не найден')
+        doc_type = str(data.get('doc_type') or '').strip()
+        if not doc_type:
+            raise ValueError('Не указан тип документа')
+        if rec.get('transport') == 'odata':
+            p = rec.get('params') or {}
+            probe = {'base': p.get('base'), 'login': p.get('login'), 'password': p.get('password'),
+                     'ignore_cert': p.get('ignore_cert')}
+            for s in odata_service_info(probe):
+                if s.get('name') == doc_type:
+                    return {'ok': True, 'fields': [{'name': x.get('name'), 'label': x.get('name')}
+                                                   for x in (s.get('props') or []) if x.get('name')]}
+            raise ValueError(f'Набор «{doc_type}» не найден в $metadata источника')
+        return {'ok': True, 'fields': src_fields(rec)}
+    if path == '/api/docs/load':
+        rec = src_find(str(data.get('source') or ''))
+        if not rec:
+            raise ValueError('Источник не найден')
+        if not rec.get('enabled', True):
+            raise ValueError('Источник отключён администратором')
+        doc_type = str(data.get('doc_type') or '').strip()
+        if not doc_type:
+            raise ValueError('Выберите тип документа 1С')
+        date_from = str(data.get('date_from') or '').strip()
+        date_to = str(data.get('date_to') or '').strip()
+        for d in (date_from, date_to):
+            if d and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', d):
+                raise ValueError('Период задаётся датами ГГГГ-ММ-ДД')
+        date_field = str(data.get('date_field') or '').strip()
+        if not date_field:
+            for tp in doc_types(rec):
+                if tp['name'] == doc_type:
+                    date_field = tp.get('date_field') or ''
+                    break
+        if (date_from or date_to) and not date_field:
+            raise ValueError('У этого типа не нашлось поля даты — укажите его явно или уберите период')
+        now = datetime.now().isoformat(timespec='seconds')
+        raw = docs_fetch(rec, doc_type, date_from, date_to, date_field, data.get('limit'))
+        with STORE_LOCK:
+            rows = docs_load_raw()
+            by_uid = {(r.get('doc_type'), r.get('uid')): i for i, r in enumerate(rows)}
+            added = updated = 0
+            preview = []
+            for rd in raw:
+                doc = _doc_normalize(rd, rec, doc_type, now)
+                key = (doc['doc_type'], doc['uid'])
+                if key in by_uid:
+                    rows[by_uid[key]] = doc
+                    updated += 1
+                else:
+                    by_uid[key] = len(rows)
+                    rows.append(doc)
+                    added += 1
+                if len(preview) < 10:
+                    preview.append({k: doc[k] for k in ('uid', 'doc_type', 'number', 'date', 'posted')})
+            docs_save_raw(rows)
+        log('info', f"Документы 1С: «{rec.get('name')}» {doc_type} за {date_from or '…'}—{date_to or '…'}: "
+                    f"прочитано {len(raw)}, новых {added}, обновлено {updated}",
+            user=user.get('fio') or 'панель')
+        return {'ok': True, 'read': len(raw), 'added': added, 'updated': updated,
+                'date_field': date_field, 'preview': preview}
+    if path == '/api/docs/list':
+        dt = str(data.get('doc_type') or '').strip()
+        date_from = str(data.get('date_from') or '').strip()
+        date_to = str(data.get('date_to') or '').strip()
+        rows = docs_load_raw()
+        if dt:
+            rows = [r for r in rows if r.get('doc_type') == dt]
+        if date_from:
+            rows = [r for r in rows if (r.get('date') or '') >= date_from]
+        if date_to:
+            rows = [r for r in rows if (r.get('date') or '') <= date_to]
+        rows.sort(key=lambda r: (r.get('date') or '', r.get('number') or ''), reverse=True)
+        limit = max(1, min(int(data.get('limit') or 300), 1000))
+        items = [{k: r.get(k) for k in ('uid', 'doc_type', 'number', 'date', 'posted', 'loaded_at')}
+                 | {'fields_count': len(r.get('fields') or {})} for r in rows[:limit]]
+        types = sorted({r.get('doc_type') for r in docs_load_raw() if r.get('doc_type')})
+        return {'ok': True, 'items': items, 'total': len(rows), 'types': types}
+    if path == '/api/docs/delete':
+        uid = str(data.get('uid') or '')
+        dt = str(data.get('doc_type') or '').strip()
+        rows = docs_load_raw()
+        left = [r for r in rows if not (r.get('uid') == uid and (not dt or r.get('doc_type') == dt))]
+        docs_save_raw(left)
+        return {'ok': True, 'removed': len(rows) - len(left)}
+    raise ValueError('Нет такой команды документов 1С')
+
+
+# =====================================================================
+# СОПОСТАВЛЕНИЕ РЕКВИЗИТОВ ДОКУМЕНТОВ 1С ↔ РЕЕСТРОВ ПАНЕЛИ
+# Таблица: тип документа 1С | реквизит документа 1С | тип реестра | реквизит
+# реестра. Хранится в «Панель — сопоставление реквизитов 1С.json».
+# =====================================================================
+
+ФАЙЛ_СОПОСТ_РЕКВ = 'Панель — сопоставление реквизитов 1С.json'
+DMAP_REGISTRIES = ('ОАО', 'ОПАиЗ', 'ОВРК')
+
+
+def dmap_load_raw():
+    rows = _json_file(ФАЙЛ_СОПОСТ_РЕКВ, [])
+    return rows if isinstance(rows, list) else []
+
+
+def dmap_save_raw(rows):
+    write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СОПОСТ_РЕКВ, json.dumps(rows, ensure_ascii=False, indent=1))
+
+
+def dmap_api(path, data, user):
+    """POST /api/dmap/… — таблица сопоставления реквизитов (только админ)."""
+    if not user.get('admin'):
+        raise PermissionError('Сопоставление реквизитов доступно только администратору')
+    if path == '/api/dmap/list':
+        return {'ok': True, 'items': dmap_load_raw(), 'registries': list(DMAP_REGISTRIES),
+                'oao_columns': [c['header'] for c in registry_columns()]}
+    if path == '/api/dmap/save':
+        doc_type = str(data.get('doc_type') or '').strip()
+        src_field = str(data.get('src_field') or '').strip()
+        registry = str(data.get('registry') or '').strip()
+        reg_field = str(data.get('reg_field') or '').strip()
+        if not doc_type:
+            raise ValueError('Выберите тип документа 1С')
+        if not src_field:
+            raise ValueError('Выберите реквизит документа 1С')
+        if registry not in DMAP_REGISTRIES:
+            raise ValueError('Тип реестра — один из: ' + ', '.join(DMAP_REGISTRIES))
+        if not reg_field:
+            raise ValueError('Укажите реквизит (колонку) реестра панели')
+        with STORE_LOCK:
+            rows = dmap_load_raw()
+            rid = str(data.get('id') or '').strip()
+            old = next((x for x in rows if x.get('id') == rid), None) if rid else None
+            dup = next((x for x in rows if x is not old and x.get('doc_type') == doc_type
+                        and x.get('src_field') == src_field and x.get('registry') == registry), None)
+            if dup:
+                raise ValueError('Такая строка уже есть: этот реквизит 1С для этого реестра уже сопоставлен')
+            now = datetime.now().isoformat(timespec='seconds')
+            if not rid:
+                base = 'dm-' + hashlib.sha1(f'{doc_type}|{src_field}|{registry}'.encode('utf-8')).hexdigest()[:8]
+                rid, n = base, 2
+                while any(x.get('id') == rid for x in rows):
+                    rid = f'{base}-{n}'
+                    n += 1
+            rec = {'id': rid, 'doc_type': doc_type[:200], 'src_field': src_field[:200],
+                   'registry': registry, 'reg_field': reg_field[:200],
+                   'created_at': (old or {}).get('created_at') or now, 'updated_at': now}
+            rows = [rec if x.get('id') == rid else x for x in rows] if old else rows + [rec]
+            dmap_save_raw(rows)
+        log('edit', f"Сопоставление реквизитов: {doc_type}.{src_field} → {registry}.{reg_field}",
+            user=user.get('fio') or 'панель')
+        return {'ok': True, 'item': rec}
+    if path == '/api/dmap/delete':
+        rid = str(data.get('id') or '')
+        rows = dmap_load_raw()
+        dmap_save_raw([x for x in rows if x.get('id') != rid])
+        return {'ok': True}
+    raise ValueError('Нет такой команды сопоставления реквизитов')
 
 
 # =====================================================================
@@ -9556,6 +9874,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, src_api(path, data, user))
             elif path.startswith('/api/sync/'):
                 self.send_json(200, sync_api(path, data, user))
+            elif path.startswith('/api/docs/'):
+                self.send_json(200, docs_api(path, data, user))
+            elif path.startswith('/api/dmap/'):
+                self.send_json(200, dmap_api(path, data, user))
             elif path == '/api/dirs/save':
                 if not user.get('admin'):
                     self.send_json(403, {'ok': False, 'message': 'Справочники меняет администратор'})
@@ -11566,6 +11888,28 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <h3 style="margin-top:16px">Журнал прогонов</h3>
     <div class="tablewrap"><table class="at" id="syncLog"></table></div>
   </section>
+  <section class="card adm-pane" data-pane="sync" hidden>
+    <h2>Загрузка документов из 1С <span class="muted">внутренние документы: выбор типа документа и периода</span></h2>
+    <div class="toolbar" style="flex-wrap:wrap;gap:8px">
+      <label class="muted" for="doclSource">Источник</label><select id="doclSource"></select>
+      <label class="muted" for="doclType">Тип документа</label><select id="doclType" style="min-width:240px"></select>
+      <label class="muted" for="doclFrom">с</label><input type="date" id="doclFrom">
+      <label class="muted" for="doclTo">по</label><input type="date" id="doclTo">
+      <span class="grow"></span>
+      <button class="btn primary" id="doclRun">Загрузить из 1С</button>
+      <button class="btn" id="doclShow">Показать загруженные</button>
+    </div>
+    <div class="hint">Документы читаются из 1С постранично и складываются во внутреннее хранилище панели (ключ — тип документа + GUID). Повторная загрузка обновляет уже полученные документы, дублей не будет.</div>
+    <div class="warnbox" id="doclWarn" style="margin:8px 0 0"></div>
+    <div class="muted" id="doclInfo" style="margin:6px 0"></div>
+    <div class="tablewrap" style="max-height:380px;overflow:auto"><table class="at" id="doclTable"></table></div>
+  </section>
+  <section class="card adm-pane" data-pane="sync" hidden>
+    <h2>Сопоставление реквизитов документов <span class="muted">как реквизиты документа 1С ложатся в реестры панели</span></h2>
+    <div class="toolbar"><span class="muted">Для каждого типа документа 1С укажите, какой реквизит в какую колонку какого реестра панели переносить.</span><span class="grow"></span><button class="btn primary" id="dmapAdd">+ Сопоставление реквизита</button></div>
+    <div class="tablewrap"><table class="at" id="dmapTable"></table></div>
+    <div class="warnbox" id="dmapWarn" style="margin:8px 0 0"></div>
+  </section>
   <section class="card adm-pane" data-pane="sched" hidden>
     <h2>Расписание авто-синхронизации <span class="muted">панель сама опрашивает источники в заданные интервалы</span></h2>
     <div class="fgrid" style="gap:10px 14px;margin-bottom:10px">
@@ -11879,6 +12223,22 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     </div>
     <div class="sheet-foot"><button class="btn" id="mapmPreview">Предпросмотр строк источника</button><span class="grow"></span><button class="btn primary" id="mapmSave">Сохранить сопоставление</button></div>
     <div class="tablewrap" id="mapmPreviewWrap" hidden style="max-height:260px;overflow:auto;margin:0 22px 14px"><table class="at" id="mapmPreviewTbl"></table></div>
+  </div>
+</div>
+
+<!-- СОПОСТАВЛЕНИЕ РЕКВИЗИТА ДОКУМЕНТА 1С ↔ РЕЕСТР ПАНЕЛИ -->
+<div class="modal" id="dmapm" role="dialog" aria-modal="true" aria-labelledby="dmapmTitle">
+  <div class="sheet" style="width:min(760px,100%)">
+    <div class="sheet-head"><h2 id="dmapmTitle">Сопоставление реквизита</h2><span class="muted">реквизит документа 1С → колонка реестра панели</span><button class="btn x" data-close="dmapm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="dmapmWarn"></div>
+    <div style="padding:14px 22px" class="fgrid">
+      <div class="f"><label for="dmapmType">Тип документа 1С <span class="req">*</span></label><select id="dmapmType"></select></div>
+      <div class="f"><label for="dmapmField">Реквизит документа 1С <span class="req">*</span></label><select id="dmapmField"></select></div>
+      <div class="f"><label for="dmapmReg">Тип реестра панели <span class="req">*</span></label><select id="dmapmReg"></select></div>
+      <div class="f"><label for="dmapmRegField">Реквизит реестра панели <span class="req">*</span></label><input id="dmapmRegField" list="dmapmRegCols" autocomplete="off" placeholder="заголовок колонки реестра"><datalist id="dmapmRegCols"></datalist></div>
+      <div class="f full"><div class="hint">Если тип документа не выбран, список реквизитов заполнится после выбора типа. Реквизит реестра можно подобрать из подсказки или вписать вручную.</div></div>
+    </div>
+    <div class="sheet-foot"><button class="btn" id="dmapmDelete" hidden>Удалить</button><span class="grow"></span><button class="btn primary" id="dmapmSave">Сохранить</button></div>
   </div>
 </div>
 
@@ -17199,6 +17559,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       if (!res.ok) { warnIn('syncWarn', 'err', esc(res.message || 'Нет доступа')); return; }
       SYNC.maps = res.items || []; SYNC.sources = res.sources || []; SYNC.log = res.log || [];
       renderMapTable(); renderSyncLog();
+      doclSourceFill(); loadDmap(); docsShow();
     });
   }
   function syncMapById(id) { return SYNC.maps.filter(function (x) { return x.id === id; })[0] || null; }
@@ -17409,6 +17770,167 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     };
     rd.readAsDataURL(f);
     this.value = '';
+  };
+
+  // =====================================================================
+  // ЗАГРУЗКА ДОКУМЕНТОВ ИЗ 1С (внутренние документы) — только админ
+  // =====================================================================
+  var DOCS = { types: [], items: [], total: 0 };
+  var DMAP = { items: [], registries: [], oaoCols: [] };
+
+  function doclSourceFill() {
+    var sel = $('doclSource'); if (!sel) return;
+    var cur = sel.value;
+    sel.innerHTML = (SYNC.sources || []).map(function (x) {
+      return '<option value="' + esc(x.id) + '">' + esc(x.name) + ' · ' + esc(TR_NAME[x.transport] || x.transport) + '</option>';
+    }).join('');
+    if (cur && (SYNC.sources || []).some(function (x) { return x.id === cur; })) sel.value = cur;
+    doclLoadTypes();
+  }
+  function doclLoadTypes() {
+    var sid = $('doclSource').value, sel = $('doclType');
+    if (!sid) { sel.innerHTML = '<option value="">— нет источников —</option>'; return; }
+    sel.innerHTML = '<option value="">— загрузка типов… —</option>';
+    api('/api/docs/types', { source: sid }).then(function (res) {
+      if (!res.ok) { sel.innerHTML = '<option value="">— ошибка —</option>'; warnIn('doclWarn', 'err', esc(res.message)); return; }
+      warnIn('doclWarn', '', '');
+      DOCS.types = res.types || [];
+      var docs = DOCS.types.filter(function (t) { return t.kind === 'документ'; });
+      var list = docs.length ? docs : DOCS.types;
+      sel.innerHTML = '<option value="">— выберите тип документа —</option>' + list.map(function (t) {
+        return '<option value="' + esc(t.name) + '">' + esc(t.name) + (t.kind !== 'документ' ? ' (' + esc(t.kind) + ')' : '') + (t.date_field ? ' · дата: ' + esc(t.date_field) : '') + '</option>';
+      }).join('');
+    });
+  }
+  $('doclSource').onchange = doclLoadTypes;
+  $('doclRun').onclick = function () {
+    var sid = $('doclSource').value, dt = $('doclType').value;
+    if (!sid) { warnIn('doclWarn', 'err', 'Выберите источник данных 1С.'); return; }
+    if (!dt) { warnIn('doclWarn', 'err', 'Выберите тип документа 1С.'); return; }
+    warnIn('doclWarn', '', '⏳ Читаю документы из 1С…');
+    $('doclInfo').textContent = '';
+    api('/api/docs/load', { source: sid, doc_type: dt, date_from: $('doclFrom').value, date_to: $('doclTo').value }).then(function (res) {
+      if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
+      warnIn('doclWarn', '', '✓ Прочитано из 1С: ' + res.read + ', новых: ' + res.added + ', обновлено: ' + res.updated + (res.date_field ? ' · фильтр по полю ' + esc(res.date_field) : ''));
+      toast('Документы загружены: новых ' + res.added);
+      docsShow();
+    });
+  };
+  function docsShow() {
+    api('/api/docs/list', { doc_type: $('doclType').value, date_from: $('doclFrom').value, date_to: $('doclTo').value }).then(function (res) {
+      if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
+      DOCS.items = res.items || []; DOCS.total = res.total || 0;
+      $('doclInfo').textContent = DOCS.total ? ('Во внутреннем хранилище по фильтру: ' + DOCS.total + ' (показано до ' + DOCS.items.length + ')') : '';
+      $('doclTable').innerHTML = '<thead><tr><th>Тип документа</th><th>Номер</th><th>Дата</th><th>Проведён</th><th>Полей</th><th>Загружен</th><th></th></tr></thead><tbody>' +
+        (DOCS.items.length ? DOCS.items.map(function (d) {
+          return '<tr><td class="l">' + esc(d.doc_type) + '</td><td>' + esc(d.number || '—') + '</td><td>' + esc(d.date || '—') + '</td>' +
+            '<td>' + (d.posted ? '<span class="pill ok">да</span>' : 'нет') + '</td><td>' + (d.fields_count || 0) + '</td>' +
+            '<td class="muted">' + esc((d.loaded_at || '').replace('T', ' ')) + '</td>' +
+            '<td><button class="btn sm" data-docdel="' + esc(d.doc_type) + '|' + esc(d.uid) + '">✕</button></td></tr>';
+        }).join('') : '<tr><td colspan="7" class="empty">Загруженных документов пока нет — выберите источник, тип документа и период, затем «Загрузить из 1С».</td></tr>') + '</tbody>';
+    });
+  }
+  $('doclShow').onclick = docsShow;
+  $('doclTable').onclick = function (e) {
+    var b = e.target.closest('[data-docdel]'); if (!b) return;
+    var p = b.dataset.docdel.split('|');
+    api('/api/docs/delete', { doc_type: p[0], uid: p.slice(1).join('|') }).then(function (res) {
+      if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
+      toast('Документ удалён из хранилища'); docsShow();
+    });
+  };
+
+  // =====================================================================
+  // СОПОСТАВЛЕНИЕ РЕКВИЗИТОВ ДОКУМЕНТОВ 1С ↔ РЕЕСТРОВ ПАНЕЛИ — только админ
+  // =====================================================================
+  function loadDmap() {
+    api('/api/dmap/list', {}).then(function (res) {
+      if (!res.ok) { warnIn('dmapWarn', 'err', esc(res.message || 'Нет доступа')); return; }
+      DMAP.items = res.items || []; DMAP.registries = res.registries || []; DMAP.oaoCols = res.oao_columns || [];
+      renderDmapTable();
+    });
+  }
+  function renderDmapTable() {
+    $('dmapTable').innerHTML = '<thead><tr><th>Тип документа 1С</th><th>Реквизит документа 1С</th><th>Тип реестра панели</th><th>Реквизит реестра панели</th><th></th></tr></thead><tbody>' +
+      (DMAP.items.length ? DMAP.items.map(function (m) {
+        return '<tr><td class="l"><b>' + esc(m.doc_type) + '</b></td><td class="l">' + esc(m.src_field) + '</td>' +
+          '<td><span class="pill">' + esc(m.registry) + '</span></td><td class="l">' + esc(m.reg_field) + '</td>' +
+          '<td style="white-space:nowrap"><button class="btn sm" data-dmapedit="' + esc(m.id) + '">Изменить</button> ' +
+          '<button class="btn sm" data-dmapdel="' + esc(m.id) + '">✕</button></td></tr>';
+      }).join('') : '<tr><td colspan="5" class="empty">Сопоставлений реквизитов пока нет — нажмите «+ Сопоставление реквизита».</td></tr>') + '</tbody>';
+  }
+  function dmapTypeOptions(cur) {
+    var names = DOCS.types.map(function (t) { return t.name; });
+    if (cur && names.indexOf(cur) < 0) names.unshift(cur);
+    return '<option value="">— выберите тип —</option>' + names.map(function (n) {
+      return '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>';
+    }).join('');
+  }
+  function dmapLoadFields(cur) {
+    var sid = $('doclSource').value, dt = $('dmapmType').value, sel = $('dmapmField');
+    if (!sid || !dt) { sel.innerHTML = '<option value="">— сначала выберите источник и тип —</option>'; return; }
+    sel.innerHTML = '<option value="">— загрузка реквизитов… —</option>';
+    api('/api/docs/type_fields', { source: sid, doc_type: dt }).then(function (res) {
+      if (!res.ok) { sel.innerHTML = '<option value="">— ошибка —</option>'; warnIn('dmapmWarn', 'err', esc(res.message)); return; }
+      warnIn('dmapmWarn', '', '');
+      var names = (res.fields || []).map(function (f) { return f.name; }).filter(Boolean);
+      if (cur && names.indexOf(cur) < 0) names.unshift(cur);
+      sel.innerHTML = '<option value="">— выберите реквизит —</option>' + names.map(function (n) {
+        return '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>';
+      }).join('');
+    });
+  }
+  function dmapRegColsFill() {
+    var reg = $('dmapmReg').value, dl = $('dmapmRegCols');
+    dl.innerHTML = (reg === 'ОАО' ? DMAP.oaoCols : []).map(function (h) {
+      return '<option value="' + esc(h) + '"></option>';
+    }).join('');
+  }
+  var dmapmId = '';
+  function openDmapModal(item) {
+    warnIn('dmapmWarn', '', '');
+    dmapmId = item ? item.id : '';
+    if (!DOCS.types.length) doclLoadTypes();
+    $('dmapmType').innerHTML = dmapTypeOptions(item ? item.doc_type : '');
+    $('dmapmReg').innerHTML = DMAP.registries.map(function (r) {
+      return '<option value="' + esc(r) + '"' + (item && item.registry === r ? ' selected' : '') + '>' + esc(r) + '</option>';
+    }).join('');
+    $('dmapmRegField').value = item ? (item.reg_field || '') : '';
+    dmapRegColsFill();
+    if (item) { $('dmapmField').innerHTML = '<option value="">— загрузка реквизитов… —</option>'; dmapLoadFields(item.src_field); }
+    else { $('dmapmField').innerHTML = '<option value="">— сначала выберите тип —</option>'; }
+    $('dmapmDelete').hidden = !item;
+    openModal('dmapm');
+  }
+  $('dmapmType').onchange = function () { dmapLoadFields(''); };
+  $('dmapmReg').onchange = dmapRegColsFill;
+  $('dmapAdd').onclick = function () {
+    if (!$('doclSource').value) { warnIn('dmapWarn', 'err', 'Сначала выберите источник в карточке «Загрузка документов из 1С» выше.'); return; }
+    openDmapModal(null);
+  };
+  $('dmapTable').onclick = function (e) {
+    var ed = e.target.closest('[data-dmapedit]'), del = e.target.closest('[data-dmapdel]');
+    if (ed) { var it = DMAP.items.filter(function (x) { return x.id === ed.dataset.dmapedit; })[0]; if (it) openDmapModal(it); }
+    else if (del) {
+      api('/api/dmap/delete', { id: del.dataset.dmapdel }).then(function (res) {
+        if (!res.ok) { warnIn('dmapWarn', 'err', esc(res.message)); return; }
+        toast('Сопоставление удалено'); loadDmap();
+      });
+    }
+  };
+  $('dmapmSave').onclick = function () {
+    var payload = { id: dmapmId, doc_type: $('dmapmType').value, src_field: $('dmapmField').value,
+                    registry: $('dmapmReg').value, reg_field: $('dmapmRegField').value.trim() };
+    api('/api/dmap/save', payload).then(function (res) {
+      if (!res.ok) { warnIn('dmapmWarn', 'err', esc(res.message)); return; }
+      closeModal('dmapm'); toast('Сопоставление сохранено'); loadDmap();
+    });
+  };
+  $('dmapmDelete').onclick = function () {
+    api('/api/dmap/delete', { id: dmapmId }).then(function (res) {
+      if (!res.ok) { warnIn('dmapmWarn', 'err', esc(res.message)); return; }
+      closeModal('dmapm'); toast('Сопоставление удалено'); loadDmap();
+    });
   };
 
   // =====================================================================
