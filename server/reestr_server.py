@@ -2491,6 +2491,8 @@ def docs_api(path, data, user):
         left = [r for r in rows if not (r.get('uid') == uid and (not dt or r.get('doc_type') == dt))]
         docs_save_raw(left)
         return {'ok': True, 'removed': len(rows) - len(left)}
+    if path == '/api/docs/push':
+        return docs_push(data, user)
     raise ValueError('Нет такой команды документов 1С')
 
 
@@ -2519,7 +2521,11 @@ def dmap_api(path, data, user):
         raise PermissionError('Сопоставление реквизитов доступно только администратору')
     if path == '/api/dmap/list':
         return {'ok': True, 'items': dmap_load_raw(), 'registries': list(DMAP_REGISTRIES),
-                'oao_columns': [c['header'] for c in registry_columns()]}
+                'oao_columns': [c['header'] for c in registry_columns()],
+                'oz_tables': {k: v.get('title') for k, v in OZ_TABLES.items()},
+                'oz_fields': {t: [{'k': c['k'], 't': c.get('t') or c['k']} for c in (v.get('cols') or [])]
+                              for t, v in OZ_TABLES.items()},
+                'ovrk_fields': [{'k': k, 't': OVRK_FIELD_TITLES.get(k, k)} for k in CONTRACT_FIELDS]}
     if path == '/api/dmap/save':
         doc_type = str(data.get('doc_type') or '').strip()
         src_field = str(data.get('src_field') or '').strip()
@@ -2562,6 +2568,217 @@ def dmap_api(path, data, user):
         dmap_save_raw([x for x in rows if x.get('id') != rid])
         return {'ok': True}
     raise ValueError('Нет такой команды сопоставления реквизитов')
+
+
+# =====================================================================
+# ПЕРЕНОС ЗАГРУЖЕННЫХ ДОКУМЕНТОВ 1С В РЕЕСТРЫ ПАНЕЛИ (по таблице dmap)
+# Строка реестра ищется по ключу: реквизит документа (key_src_field) ↔
+# реквизит реестра (key_reg_field). Значения пишутся только в сопоставленные
+# колонки; пустые значения из 1С ничего не затирают; формулы ОАО не трогаются.
+# =====================================================================
+
+OVRK_FIELD_TITLES = {'kind': 'Вид договора', 'unit': 'Подразделение', 'subject': 'Предмет договора',
+                     'org': 'Контрагент', 'inn': 'ИНН', 'address': 'Адрес', 'price': 'Сумма договора',
+                     'term': 'Срок исполнения', 'validity': 'Срок действия', 'cnum': 'Номер договора',
+                     'monopolist': 'Единственный поставщик', 'resp': 'Ответственный', 'status': 'Статус',
+                     'note': 'Примечание', 'advance': 'Аванс'}
+PUSH_KEY_DEFAULT = {'ОАО': 'Номер и Дата публикации', 'ОПАиЗ': 'n1c', 'ОВРК': 'cnum'}
+
+
+def _oz_col_key(table, ref):
+    """Ключ колонки таблицы ОПАиЗ по её ключу или заголовку («n1c» / «Номер заявки 1С»)."""
+    ref_n = nkey(ref)
+    for c in OZ_TABLES.get(table, {}).get('cols') or []:
+        if c.get('k') == ref or nkey(c.get('k')) == ref_n or (c.get('t') and nkey(c.get('t')) == ref_n):
+            return c['k']
+    return None
+
+
+def _ovrk_field_key(ref):
+    """Ключ поля договора ОВРК по ключу или заголовку («cnum» / «Номер договора»)."""
+    ref_n = nkey(ref)
+    for k in CONTRACT_FIELDS:
+        if nkey(k) == ref_n or nkey(OVRK_FIELD_TITLES.get(k, '')) == ref_n:
+            return k
+    return None
+
+
+def _push_oao(key, updates, dry):
+    """Перезапись ячеек строки реестра ОАО. → (число изменений, состояние) или (None, 'строка не найдена')."""
+    path = registry_of(key)
+    if not path:
+        return None, 'строка не найдена'
+    with REG_LOCK:
+        try:
+            wb = load_workbook(path) if not dry else load_workbook(path, read_only=True)
+        except PermissionError:
+            raise RegistryBusy('Реестр открыт в Excel')
+        try:
+            loc = locate(wb, key)
+            if not loc:
+                return None, 'строка не найдена'
+            heads_inv = {nkey(h): c for c, h in (loc.get('heads') or {}).items()}
+            changes = 0
+            for header, value in updates.items():
+                col = heads_inv.get(nkey(header))
+                if not col:
+                    raise ValueError(f'колонка «{str(header)[:40]}» не найдена в реестре ОАО')
+                cell = loc['ws'].cell(loc['row'], col)
+                old = cell.value
+                if isinstance(old, str) and old.startswith('='):
+                    continue                            # формулы не трогаем
+                new = coerce(' '.join(str(header).split()), value)
+                if same_value(old, new):
+                    continue
+                if not dry:
+                    cell.value = safe(new) if new not in ('',) else None
+                changes += 1
+            if not dry and changes:
+                save_workbook(wb, path)
+            return changes, 'изменится' if dry and changes else ('без изменений' if not changes else 'записано')
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+
+def _push_opaiz(table, key_ref, key, updates, dry, actor):
+    """Запись в строку таблицы ОПАиЗ (поиск по колонке-ключу). → (изменений, состояние) | (None, ...)."""
+    key_k = _oz_col_key(table, key_ref)
+    if not key_k:
+        raise ValueError(f'Колонка-ключ «{key_ref}» не найдена в таблице ОПАиЗ «{OZ_TABLES[table]["title"]}»')
+    cols = {c['k']: c for c in OZ_TABLES[table]['cols']}
+    vals = {}
+    for ref, v in updates.items():
+        k = _oz_col_key(table, ref)
+        if not k:
+            raise ValueError(f'Колонка «{str(ref)[:40]}» не найдена в таблице ОПАиЗ')
+        if cols[k].get('ty') in ('calc', 'ro'):
+            continue                                # расчётные колонки не трогаем
+        vals[k] = v
+    if not vals:
+        return 0, 'нечего писать'
+    row = next((r for r in oz_load(table)['rows'] if str(r.get(key_k) or '').strip() == key), None)
+    if not row:
+        return None, 'строка не найдена'
+    if dry:
+        ch = sum(1 for k, v in vals.items() if str(_coerce_oz(cols[k], v)) != str(row.get(k, '')))
+        return ch, 'изменится' if ch else 'без изменений'
+    _, changes = oz_save_row(table, row['id'], vals, None, actor, auto=True, note='из документа 1С')
+    return len(changes), 'записано' if changes else 'без изменений'
+
+
+def _push_ovrk(key_ref, key, updates, dry, actor):
+    """Запись в карточку договора ОВРК (поиск по полю-ключу). → (изменений, состояние) | (None, ...)."""
+    key_k = _ovrk_field_key(key_ref)
+    if not key_k:
+        raise ValueError(f'Поле-ключ «{key_ref}» не найдено в карточке договора ОВРК')
+    vals = {}
+    for ref, v in updates.items():
+        k = _ovrk_field_key(ref)
+        if not k:
+            raise ValueError(f'Поле «{str(ref)[:40]}» не найдено в карточке договора ОВРК')
+        vals[k] = v
+    if not vals:
+        return 0, 'нечего писать'
+    c = next((x for x in ovrk_load()['rows'] if str(x.get(key_k) or '').strip() == key), None)
+    if not c:
+        return None, 'договор не найден'
+    if dry:
+        ch = sum(1 for k, v in vals.items() if str(v if not isinstance(v, str) else v.strip()) != str(c.get(k) or ''))
+        return ch, 'изменится' if ch else 'без изменений'
+    _, changed = ovrk_save(c['id'], vals, None, actor, note='из документа 1С')
+    return (1 if changed else 0), 'записано' if changed else 'без изменений'
+
+
+def docs_push(data, user):
+    """POST /api/docs/push — перенос реквизитов загруженных документов в реестры по таблице dmap.
+    dry=True (по умолчанию) — только предпросмотр, ничего не пишет."""
+    doc_type = str(data.get('doc_type') or '').strip()
+    if not doc_type:
+        raise ValueError('Выберите тип документа 1С')
+    dry = bool(data.get('dry', True))
+    registry = str(data.get('registry') or '').strip()
+    if registry and registry not in DMAP_REGISTRIES:
+        raise ValueError('Тип реестра — один из: ' + ', '.join(DMAP_REGISTRIES))
+    oz_table = str(data.get('oz_table') or 'zayavki').strip()
+    if oz_table not in OZ_TABLES:
+        raise ValueError('Нет такой таблицы реестра ОПАиЗ')
+    key_src = str(data.get('key_src_field') or '').strip()
+    if not key_src:
+        raise ValueError('Укажите реквизит документа-ключ — по нему ищется строка реестра')
+    key_reg = str(data.get('key_reg_field') or '').strip()
+    date_from, date_to = str(data.get('date_from') or '').strip(), str(data.get('date_to') or '').strip()
+    for d in (date_from, date_to):
+        if d and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', d):
+            raise ValueError('Период задаётся датами ГГГГ-ММ-ДД')
+    docs = [r for r in docs_load_raw() if r.get('doc_type') == doc_type]
+    uids = {str(u) for u in (data.get('uids') or [])}
+    if uids:
+        docs = [r for r in docs if r.get('uid') in uids]
+    if date_from:
+        docs = [r for r in docs if (r.get('date') or '') >= date_from]
+    if date_to:
+        docs = [r for r in docs if (r.get('date') or '') <= date_to]
+    if not docs:
+        raise ValueError('Нет загруженных документов этого типа — сначала нажмите «Загрузить из 1С»')
+    maps = [m for m in dmap_load_raw() if m.get('doc_type') == doc_type
+            and (not registry or m.get('registry') == registry)]
+    if not maps:
+        raise ValueError('В таблице сопоставления нет строк для этого типа документа'
+                         + (f' и реестра {registry}' if registry else ''))
+    by_reg = {}
+    for m in maps:
+        by_reg.setdefault(m.get('registry'), []).append(m)
+    entry = {'at': datetime.now().isoformat(timespec='seconds'), 'dry': dry, 'doc_type': doc_type,
+             'read': 0, 'matched': 0, 'changed': 0, 'skipped': 0, 'errors': [], 'preview': []}
+    for reg, rows in by_reg.items():
+        reg_key = key_reg or PUSH_KEY_DEFAULT[reg]
+        for doc in docs:
+            entry['read'] += 1
+            fields = doc.get('fields') or {}
+            key = str(fields.get(key_src) or '').strip()
+            if not key:
+                entry['skipped'] += 1
+                continue
+            updates = {}
+            for m in rows:
+                if nkey(m.get('reg_field')) == nkey(reg_key):
+                    continue                        # ключевую колонку не перезаписываем
+                v = fields.get(m.get('src_field'))
+                if v not in (None, ''):
+                    updates[m['reg_field']] = v
+            if not updates:
+                entry['skipped'] += 1
+                continue
+            try:
+                if reg == 'ОАО':
+                    ch, state = _push_oao(key, updates, dry)
+                elif reg == 'ОПАиЗ':
+                    ch, state = _push_opaiz(oz_table, reg_key, key, updates, dry, user)
+                else:
+                    ch, state = _push_ovrk(reg_key, key, updates, dry, user)
+            except RegistryBusy as e:
+                entry['errors'].append(f'{reg}, {key}: {str(e)[:120]}')
+                continue
+            except Exception as e:
+                entry['errors'].append(f'{reg}, {key}: {type(e).__name__}: {str(e)[:160]}')
+                continue
+            if ch is None:
+                entry['skipped'] += 1
+            else:
+                entry['matched'] += 1
+                entry['changed'] += ch
+            if len(entry['preview']) < 50:
+                entry['preview'].append({'doc': doc.get('number') or doc.get('uid'), 'registry': reg,
+                                         'key': key, 'state': state, 'fields': len(updates)})
+            time.sleep(0.01)
+    log('info', f"Перенос документов 1С в реестры ({doc_type}){' (предпросмотр)' if dry else ''}: "
+                f"документов {entry['read']}, совпало {entry['matched']}, изменено {entry['changed']}, "
+                f"пропущено {entry['skipped']}" + (f", ошибок {len(entry['errors'])}" if entry['errors'] else ''),
+        user=user.get('fio') or 'панель')
+    return {'ok': True, **entry}
 
 
 # =====================================================================
@@ -11896,6 +12113,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <label class="muted" for="doclFrom">с</label><input type="date" id="doclFrom">
       <label class="muted" for="doclTo">по</label><input type="date" id="doclTo">
       <span class="grow"></span>
+      <button class="btn" id="doclPush" title="Перенести реквизиты загруженных документов в строки реестров по таблице сопоставления">→ Перенести в реестры</button>
       <button class="btn primary" id="doclRun">Загрузить из 1С</button>
       <button class="btn" id="doclShow">Показать загруженные</button>
     </div>
@@ -12223,6 +12441,23 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     </div>
     <div class="sheet-foot"><button class="btn" id="mapmPreview">Предпросмотр строк источника</button><span class="grow"></span><button class="btn primary" id="mapmSave">Сохранить сопоставление</button></div>
     <div class="tablewrap" id="mapmPreviewWrap" hidden style="max-height:260px;overflow:auto;margin:0 22px 14px"><table class="at" id="mapmPreviewTbl"></table></div>
+  </div>
+</div>
+
+<!-- ПЕРЕНОС ДОКУМЕНТОВ 1С В РЕЕСТРЫ ПАНЕЛИ -->
+<div class="modal" id="dpm" role="dialog" aria-modal="true" aria-labelledby="dpmTitle">
+  <div class="sheet" style="width:min(860px,100%)">
+    <div class="sheet-head"><h2 id="dpmTitle">Перенос документов в реестры</h2><span class="muted" id="dpmSub"></span><button class="btn x" data-close="dpm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="dpmWarn"></div>
+    <div style="padding:14px 22px" class="fgrid">
+      <div class="f"><label for="dpmReg">Реестр панели</label><select id="dpmReg"><option value="">все, для которых есть сопоставление</option></select></div>
+      <div class="f" id="dpmOzWrap" hidden><label for="dpmOzTable">Таблица реестра ОПАиЗ</label><select id="dpmOzTable"></select></div>
+      <div class="f"><label for="dpmKeySrc">Реквизит документа-ключ <span class="req">*</span></label><input id="dpmKeySrc" list="dpmSrcCols" autocomplete="off" placeholder="например, Number"><datalist id="dpmSrcCols"></datalist></div>
+      <div class="f"><label for="dpmKeyReg">Реквизит реестра-ключ</label><input id="dpmKeyReg" list="dpmRegCols" autocomplete="off"><datalist id="dpmRegCols"></datalist></div>
+      <div class="f full"><div class="hint">Строка реестра ищется по совпадению ключа: значение реквизита документа = значение реквизита реестра. Пишутся только сопоставленные реквизиты; пустые значения ничего не затирают, формулы ОАО не трогаются. Ключевая колонка не перезаписывается. Если реквизит реестра-ключ не задан: ОАО — «Номер и Дата публикации», ОПАиЗ — «Номер заявки 1С», ОВРК — «Номер договора».</div></div>
+    </div>
+    <div class="sheet-foot"><span class="muted" id="dpmRes"></span><span class="grow"></span><button class="btn" id="dpmDry">Предпросмотр</button><button class="btn primary" id="dpmGo">Применить</button></div>
+    <div class="tablewrap" id="dpmPrevWrap" hidden style="max-height:280px;overflow:auto;margin:0 22px 14px"><table class="at" id="dpmPrev"></table></div>
   </div>
 </div>
 
@@ -17776,7 +18011,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   // ЗАГРУЗКА ДОКУМЕНТОВ ИЗ 1С (внутренние документы) — только админ
   // =====================================================================
   var DOCS = { types: [], items: [], total: 0 };
-  var DMAP = { items: [], registries: [], oaoCols: [] };
+  var DMAP = { items: [], registries: [], oaoCols: [], ozTables: {}, ozFields: {}, ovrkFields: [] };
 
   function doclSourceFill() {
     var sel = $('doclSource'); if (!sel) return;
@@ -17847,6 +18082,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     api('/api/dmap/list', {}).then(function (res) {
       if (!res.ok) { warnIn('dmapWarn', 'err', esc(res.message || 'Нет доступа')); return; }
       DMAP.items = res.items || []; DMAP.registries = res.registries || []; DMAP.oaoCols = res.oao_columns || [];
+      DMAP.ozTables = res.oz_tables || {}; DMAP.ozFields = res.oz_fields || {}; DMAP.ovrkFields = res.ovrk_fields || [];
       renderDmapTable();
     });
   }
@@ -17881,10 +18117,11 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     });
   }
   function dmapRegColsFill() {
-    var reg = $('dmapmReg').value, dl = $('dmapmRegCols');
-    dl.innerHTML = (reg === 'ОАО' ? DMAP.oaoCols : []).map(function (h) {
-      return '<option value="' + esc(h) + '"></option>';
-    }).join('');
+    var reg = $('dmapmReg').value, dl = $('dmapmRegCols'), cols = [];
+    if (reg === 'ОАО') cols = DMAP.oaoCols;
+    else if (reg === 'ОПАиЗ') cols = (DMAP.ozFields.zayavki || []).map(function (x) { return x.t; });
+    else if (reg === 'ОВРК') cols = DMAP.ovrkFields.map(function (x) { return x.t; });
+    dl.innerHTML = cols.map(function (h) { return '<option value="' + esc(h) + '"></option>'; }).join('');
   }
   var dmapmId = '';
   function openDmapModal(item) {
@@ -17931,6 +18168,80 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       if (!res.ok) { warnIn('dmapmWarn', 'err', esc(res.message)); return; }
       closeModal('dmapm'); toast('Сопоставление удалено'); loadDmap();
     });
+  };
+
+  // =====================================================================
+  // ПЕРЕНОС ЗАГРУЖЕННЫХ ДОКУМЕНТОВ В РЕЕСТРЫ (по таблице сопоставления)
+  // =====================================================================
+  function dpmSrcFieldsFill() {
+    var sid = $('doclSource').value, dt = $('doclType').value, dl = $('dpmSrcCols');
+    dl.innerHTML = '';
+    if (!sid || !dt) return;
+    api('/api/docs/type_fields', { source: sid, doc_type: dt }).then(function (res) {
+      if (!res.ok) return;
+      dl.innerHTML = (res.fields || []).map(function (f) {
+        return '<option value="' + esc(f.name) + '"></option>';
+      }).join('');
+    });
+  }
+  function dpmRegColsFill() {
+    var reg = $('dpmReg').value, dl = $('dpmRegCols'), cols = [];
+    if (reg === 'ОАО') cols = DMAP.oaoCols;
+    else if (reg === 'ОПАиЗ') cols = (DMAP.ozFields[$('dpmOzTable').value] || []).map(function (x) { return x.t + ' (' + x.k + ')'; });
+    else if (reg === 'ОВРК') cols = DMAP.ovrkFields.map(function (x) { return x.t + ' (' + x.k + ')'; });
+    dl.innerHTML = cols.map(function (h) { return '<option value="' + esc(h) + '"></option>'; }).join('');
+    $('dpmOzWrap').hidden = !(reg === '' || reg === 'ОПАиЗ');
+    $('dpmKeyReg').placeholder = reg === 'ОВРК' ? 'по умолчанию: Номер договора (cnum)' :
+      reg === 'ОПАиЗ' ? 'по умолчанию: Номер заявки 1С (n1c)' : 'по умолчанию: Номер и Дата публикации';
+  }
+  $('dpmReg').onchange = dpmRegColsFill;
+  $('dpmOzTable').onchange = dpmRegColsFill;
+  $('doclPush').onclick = function () {
+    var dt = $('doclType').value;
+    if (!dt) { warnIn('doclWarn', 'err', 'Сначала выберите тип документа и загрузите документы из 1С.'); return; }
+    warnIn('dpmWarn', '', '');
+    $('dpmSub').textContent = 'тип документа: ' + dt + ' · в хранилище: ' + (DOCS.total || DOCS.items.length || 0);
+    var reg = $('dpmReg');
+    reg.innerHTML = '<option value="">все, для которых есть сопоставление</option>' +
+      DMAP.registries.map(function (r) { return '<option value="' + esc(r) + '">' + esc(r) + '</option>'; }).join('');
+    var t = $('dpmOzTable');
+    t.innerHTML = Object.keys(DMAP.ozTables).map(function (k) {
+      return '<option value="' + esc(k) + '">' + esc(DMAP.ozTables[k] || k) + '</option>';
+    }).join('');
+    if (!$('dpmKeySrc').value) $('dpmKeySrc').value = 'Number';
+    $('dpmKeyReg').value = '';
+    $('dpmRes').textContent = '';
+    $('dpmPrevWrap').hidden = true; $('dpmPrev').innerHTML = '';
+    dpmRegColsFill(); dpmSrcFieldsFill();
+    openModal('dpm');
+  };
+  function dpmGo(dry) {
+    var payload = { doc_type: $('doclType').value, registry: $('dpmReg').value, oz_table: $('dpmOzTable').value,
+                    key_src_field: $('dpmKeySrc').value.trim(), key_reg_field: $('dpmKeyReg').value.trim(),
+                    date_from: $('doclFrom').value, date_to: $('doclTo').value, dry: dry };
+    if (!payload.key_src_field) { warnIn('dpmWarn', 'err', 'Укажите реквизит документа-ключ.'); return; }
+    warnIn('dpmWarn', '', dry ? '⏳ Считаю предпросмотр…' : '⏳ Переношу в реестры…');
+    $('dpmRes').textContent = '';
+    api('/api/docs/push', payload).then(function (res) {
+      if (!res.ok) { warnIn('dpmWarn', 'err', esc(res.message)); return; }
+      warnIn('dpmWarn', dry ? '' : '', '✓ ' + (dry ? 'Предпросмотр' : 'Перенос') + ': документов ' + res.read +
+        ', совпало ' + res.matched + ', ' + (dry ? 'изменится ячеек' : 'изменено') + ' ' + res.changed +
+        ', пропущено ' + res.skipped + (res.errors && res.errors.length ? ', ошибок ' + res.errors.length : ''));
+      if (res.errors && res.errors.length) warnIn('dpmWarn', 'err', 'Ошибки: ' + esc(res.errors.slice(0, 5).join(' · ')));
+      if (!dry) toast('Перенесено в реестры: изменено ' + res.changed);
+      var pv = res.preview || [];
+      $('dpmPrevWrap').hidden = !pv.length;
+      $('dpmPrev').innerHTML = '<thead><tr><th>Документ</th><th>Реестр</th><th>Ключ</th><th>Полей</th><th>Состояние</th></tr></thead><tbody>' +
+        pv.map(function (p) {
+          return '<tr><td class="l">' + esc(p.doc) + '</td><td>' + esc(p.registry) + '</td><td class="l">' + esc(p.key) + '</td>' +
+            '<td>' + p.fields + '</td><td>' + esc(p.state) + '</td></tr>';
+        }).join('') + '</tbody>';
+    });
+  }
+  $('dpmDry').onclick = function () { dpmGo(true); };
+  $('dpmGo').onclick = function () {
+    if (!confirm('Записать значения в строки реестров? Рекомендуем сначала сделать «Предпросмотр».')) return;
+    dpmGo(false);
   };
 
   // =====================================================================
