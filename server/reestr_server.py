@@ -1729,9 +1729,12 @@ def _odata_cell(v):
     if v is None:
         return ''
     if isinstance(v, dict):
-        # ссылка OData в JSON-формате 1С: {'key_ref@odata.bind': "guid'…'"} — показываем GUID вместо {}
+        # ссылка OData в JSON-формате 1С: {'key_ref@odata.bind': "guid'…'"} — GUID,
+        # если представления нет; панель подменяет такие GUID пользовательскими
+        # именами (resolve_doc_refs / doc_refs_map) — голый GUID доменным значением не считаем
         bind = next((x for x in v.values() if isinstance(x, str)), '')
-        return (v.get('Description') or v.get('Value') or v.get('RefKey') or v.get('PredefinedCode')
+        return (v.get('Description') or v.get('Наименование') or v.get('Value') or v.get('Ref_Key')
+                or v.get('RefKey') or v.get('PredefinedCode')
                 or re.sub(r"^guid'|'$", '', str(bind)))
     if isinstance(v, bool):
         return 'Да' if v else 'Нет'
@@ -2359,6 +2362,79 @@ def idoc_names():
     return d if isinstance(d, dict) else {}
 
 
+# --- Понятные имена видов документов 1С:ДО (серверный кэш OData) --------------
+# Локальный словарь псевдонимов («Панель — виды документов 1С.json») заполняется
+# только когда пользователь вручную задал имя вида; при пустом словаре таблица
+# типов и хранилище документов показывали GUID вместо имени. Функции ниже
+# кэшируют справочник «ВидыВнутреннихДокументов» по источнику, чтобы имя вида
+# было доступно и в /api/docs/list, и при переносе в реестры.
+IDOC_TYPES_TTL = 3600   # секунд; устаревший кэш обновляется лениво
+_idoc_types_cache = {}  # src_id -> {'at': datetime, 'names': {guid_нижн.: имя}}
+
+
+def _idoc_type_title(j):
+    for k in ('Description', 'Наименование', 'Name'):
+        v = str(j.get(k) or '').strip()
+        if v:
+            return v[:200]
+    code = str(j.get('Code') or '').strip()
+    return code[:200]
+
+
+def _idoc_types_fetch(rec):
+    """Справочник видов внутренних документов источника → {guid_нижн.: имя}."""
+    names = {}
+    skip, top = 0, 500
+    while True:
+        try:
+            j = _odata_http_get(rec['base'] + quote(IDOC_KINDS_ENTITY, safe='') +
+                                f'?$format=json&$top={top}&$skip={skip}', rec)
+        except Exception:
+            break
+        rows = j.get('value') if isinstance(j, dict) else None
+        if not rows:
+            break
+        for x in rows:
+            g = str(x.get('Ref_Key') or x.get('Key') or '').lower()
+            t = _idoc_type_title(x)
+            if g and t:
+                names[g] = t
+        if len(rows) < top:
+            break
+        skip += top
+        if skip > 20000:          # защита от бесконечного цикла
+            break
+    return names
+
+
+def idoc_types_cached(src_id, rec=None):
+    """Имена видов документов 1С:ДО для источника: локальные псевдонимы →
+    OData-кэш (с ленивым обновлением). Пустой словарь — если источник не
+    задан/недоступен и кэша нет."""
+    local = idoc_names()
+    ent = _idoc_types_cache.get(str(src_id))
+    fresh = bool(ent and (datetime.now() - ent['at']).total_seconds() < IDOC_TYPES_TTL)
+    if not fresh and rec is not None:
+        try:
+            fetched = _idoc_types_fetch(rec)
+        except Exception:
+            fetched = {}
+        if fetched or not ent:
+            ent = {'at': datetime.now(), 'names': fetched}
+            _idoc_types_cache[str(src_id)] = ent
+    cached = (ent or {}).get('names') or {}
+    out = dict(cached)
+    out.update({k.lower(): v for k, v in local.items() if v})   # псевдоним важнее
+    return out
+
+
+def idoc_type_name(src_id, dt_key, rec=None):
+    e = str(dt_key or '').lower()
+    if not e:
+        return ''
+    return idoc_types_cached(src_id, rec).get(e, '')
+
+
 def idoc_set_name(key, label, actor=''):
     if not re.fullmatch(r'[0-9a-fA-F-]{36}', key or ''):
         raise ValueError('Некорректный GUID вида документа')
@@ -2498,6 +2574,50 @@ def reflink_learn(src_id, field, entity):
                          json.dumps(d, ensure_ascii=False, indent=1))
 
 
+def doc_ref_guids(fields):
+    """{имя реквизита: GUID} для значений-ссылок (ключевые поля *_Key и просто
+    значения, похожие на GUID); пустой GUID не считается ссылкой."""
+    out = {}
+    for k, v in (fields or {}).items():
+        s = str(v or '').strip().strip('"')
+        if s.lower() == _GUID_EMPTY:
+            continue
+        if _GUID_RE.match(s):
+            out[str(k)] = s
+    return out
+
+
+def doc_refs_map(rec, docs, cap=800):
+    """Пакетный резолв представлений ссылок для списка документов одного типа:
+    {uid: {реквизит: представление}}. Уникальные GUID запрашиваются один раз и
+    попадают в постоянный кэш guid_present; за прогон — не более `cap` сетевых
+    запросов. Используется при переносе документов в реестры, чтобы в колонки
+    реестра шли понятные значения, а не GUID."""
+    per_doc = {}
+    guids = set()
+    for d in docs:
+        g = doc_ref_guids(d.get('fields') or {})
+        if g:
+            per_doc[d.get('uid')] = g
+            guids.update(g.values())
+    if not per_doc:
+        return {}
+    texts = {}
+    budget = max(1, min(int(cap or 1), 5000))
+    for guid in sorted(guids):
+        if len(texts) >= budget:
+            break
+        t = guid_present(rec, '', guid)     # entity='' → ключ кэша '|guid'
+        if t:
+            texts[guid] = t
+    out = {}
+    for uid, gmap in per_doc.items():
+        res = {f: texts[g] for f, g in gmap.items() if g in texts}
+        if res:
+            out[uid] = res
+    return out
+
+
 def resolve_doc_refs(rec, doc_type, fields):
     """{реквизит_Key: представление} для GUID-значений реквизитов документа.
     Целевой набор: NavigationProperty $metadata → выученные соответствия →
@@ -2507,12 +2627,17 @@ def resolve_doc_refs(rec, doc_type, fields):
     ref_fields = {k[:-4]: str(v) for k, v in (fields or {}).items()
                   if k.endswith('_Key') and k != 'Ref_Key'
                   and _GUID_RE.match(str(v or '')) and str(v).lower() != _GUID_EMPTY}
+    # просто значения-GUID (без суффикса _Key) тоже ссылки — резолвим и их
+    for k, v in (fields or {}).items():
+        s = str(v or '').strip().strip('"')
+        if _GUID_RE.match(s) and s.lower() != _GUID_EMPTY and str(k) not in ref_fields:
+            ref_fields[str(k)] = s
     if not ref_fields:
         return {}
     try:
         sets = odata_service_info(rec)
     except Exception:
-        return {}
+        sets = []
     set_names = {s.get('name') for s in sets}
     navs = {}
     for s in sets:
@@ -2530,6 +2655,7 @@ def resolve_doc_refs(rec, doc_type, fields):
         known = navs.get(base) or learned.get(base)
         candidates = [known] if known else \
             [c for c in (IDOC_REF_HINTS.get(base), f'Catalog_{base}') if c]
+        txt = ''
         for cand in candidates:
             if cand not in set_names:
                 continue
@@ -2539,6 +2665,12 @@ def resolve_doc_refs(rec, doc_type, fields):
                 if not known:
                     reflink_learn(rec.get('id'), base, cand)
                 break
+        if not txt and not candidates:
+            # навигация неизвестна — пробуем найти объект прямым запросом без
+            # имени набора (1С отдаёт представление по контексту соединения)
+            txt = guid_present(rec, '', guid)
+            if txt:
+                out[base + '_Key'] = txt
     return out
 
 
@@ -2597,6 +2729,8 @@ def idoc_types(rec, sets):
                     or str(r.get('IsFolder') or '').lower() in ('true', 'да'):
                 continue
             key, desc = str(r.get('Ref_Key') or '').strip(), str(r.get('Description') or '').strip()
+            if not desc:
+                desc = str(r.get('Наименование') or r.get('Name') or '').strip()
             if key and desc:
                 out.append({'name': IDOC_PREFIX + key,
                             'label': alias.get(key.lower()) or desc,
@@ -2675,8 +2809,15 @@ def _doc_normalize(raw, rec, doc_type, actor_at):
     fields = {}
     for k, v in list(raw.items())[:120]:
         fields[str(k)] = str(v)[:500] if v is not None else ''
-    return {'uid': uid, 'source': rec.get('id'), 'doc_type': doc_type, 'number': number,
-            'date': date_iso, 'posted': _doc_posted(_doc_pick(raw, _DOC_POSTED_KEYS)),
+    # понятное имя вида внутреннего документа (из локального словаря панели) —
+    # чтобы в хранилище и реестрах был человекочитаемый тип, а не GUID вида
+    dt_lbl = ''
+    if str(doc_type).startswith(IDOC_PREFIX):
+        dt_lbl = idoc_names().get(doc_type[len(IDOC_PREFIX):].lower(), '')
+    return {'uid': uid, 'source': rec.get('id'), 'doc_type': doc_type,
+            'doc_type_label': dt_lbl,
+            'number': number, 'date': date_iso,
+            'posted': _doc_posted(_doc_pick(raw, _DOC_POSTED_KEYS)),
             'fields': fields, 'loaded_at': actor_at}
 
 
@@ -2751,6 +2892,17 @@ def docs_api(path, data, user):
         except Exception:
             pass                        # кэш типов — опция, не должна ломать ответ
         return {'ok': True, 'types': types}
+    if path == '/api/docs/type_names':
+        # понятные имена видов документов 1С:ДО для источника: {guid_нижн.: имя}
+        sid = str(data.get('source') or '').strip()
+        rec = None
+        sr = src_find(sid)
+        if sr and sr.get('transport') == 'odata':
+            try:
+                rec = _src_odata_rec(sr)
+            except Exception:
+                rec = None
+        return {'ok': True, 'names': idoc_types_cached(sid, rec)}
     if path == '/api/docs/types_cached':
         sid = str(data.get('source') or '').strip()
         d = dtype_cache()
@@ -2840,8 +2992,17 @@ def docs_api(path, data, user):
             rows = [r for r in rows if (r.get('date') or '') <= date_to]
         rows.sort(key=lambda r: (r.get('date') or '', r.get('number') or ''), reverse=True)
         limit = max(1, min(int(data.get('limit') or 300), 1000))
-        items = [{k: r.get(k) for k in ('uid', 'doc_type', 'number', 'date', 'posted', 'loaded_at')}
-                 | {'fields_count': len(r.get('fields') or {})} for r in rows[:limit]]
+        # дообогатим понятными именами видов документов: сохранённый label →
+        # ленивый OData-кэш источника (чтобы в таблице не было GUID вида)
+        enriched = []
+        for r in rows[:limit]:
+            y = dict(r)
+            if str(y.get('doc_type') or '').startswith(IDOC_PREFIX) and not y.get('doc_type_label'):
+                y['doc_type_label'] = idoc_types_for_doc(y)
+            enriched.append(y)
+        items = [{k: r.get(k) for k in ('uid', 'doc_type', 'doc_type_label', 'number',
+                                        'date', 'posted', 'loaded_at')}
+                 | {'fields_count': len(r.get('fields') or {})} for r in enriched]
         types = sorted({r.get('doc_type') for r in docs_load_raw() if r.get('doc_type')})
         return {'ok': True, 'items': items, 'total': len(rows), 'types': types}
     if path == '/api/docs/get':
@@ -2850,6 +3011,7 @@ def docs_api(path, data, user):
         for r in docs_load_raw():
             if r.get('uid') == uid and (not dt or r.get('doc_type') == dt):
                 resolved = {}
+                degraded = False
                 sr = src_find(r.get('source') or '')
                 if sr and sr.get('transport') == 'odata':
                     try:
@@ -2857,7 +3019,15 @@ def docs_api(path, data, user):
                                                     r.get('doc_type') or '', r.get('fields') or {})
                     except Exception:
                         resolved = {}   # 1С недоступна — форма покажет исходные значения
-                return {'ok': True, 'item': r, 'resolved': resolved}
+                    # если в полях есть GUID-ссылки, а резолв ничего не дал —
+                    # предупреждаем, что показаны исходные значения из хранилища
+                    if not resolved and doc_ref_guids(r.get('fields') or {}):
+                        degraded = True
+                item = dict(r)
+                if str(item.get('doc_type') or '').startswith(IDOC_PREFIX) \
+                        and not item.get('doc_type_label'):
+                    item['doc_type_label'] = idoc_types_for_doc(item)
+                return {'ok': True, 'item': item, 'resolved': resolved, 'degraded': degraded}
         raise ValueError('Документ не найден во внутреннем хранилище')
     if path == '/api/docs/delete':
         uid = str(data.get('uid') or '')
@@ -2894,12 +3064,48 @@ def dmap_save_raw(rows):
     write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СОПОСТ_РЕКВ, json.dumps(rows, ensure_ascii=False, indent=1))
 
 
+def idoc_types_for_doc(doc):
+    """Понятное имя вида внутреннего документа для записи хранилища: локальные
+    псевдонимы → OData-кэш источника (ленивая загрузка). '' — если неизвестно."""
+    dt = str(doc.get('doc_type') or '')
+    if not dt.startswith(IDOC_PREFIX):
+        return ''
+    key = dt[len(IDOC_PREFIX):].lower()
+    local = idoc_names().get(key, '')
+    if local:
+        return local
+    src = str(doc.get('source') or '')
+    rec = None
+    try:
+        sr = src_find(src)
+        if sr and sr.get('transport') == 'odata':
+            rec = _src_odata_rec(sr)
+    except Exception:
+        rec = None
+    return idoc_type_name(src, key, rec)
+
+
+def dmap_label_rows():
+    """Строки dmap с добавленным doc_type_label — чтобы UI показывал понятный
+    тип документа даже когда список типов источника (DOCS.types) пуст."""
+    rows = dmap_load_raw()
+    out = []
+    for x in rows:
+        y = dict(x)
+        lbl = ''
+        if str(x.get('doc_type') or '').startswith(IDOC_PREFIX):
+            lbl = idoc_names().get(x['doc_type'][len(IDOC_PREFIX):].lower(), '')
+        y['doc_type_label'] = lbl
+        out.append(y)
+    return out
+
+
 def dmap_api(path, data, user):
     """POST /api/dmap/… — таблица сопоставления реквизитов (только админ)."""
     if not user.get('admin'):
         raise PermissionError('Сопоставление реквизитов доступно только администратору')
     if path == '/api/dmap/list':
-        return {'ok': True, 'items': dmap_load_raw(), 'registries': list(DMAP_REGISTRIES),
+        return {'ok': True, 'items': dmap_label_rows(), 'registries': list(DMAP_REGISTRIES),
                 'oao_columns': [c['header'] for c in registry_columns()],
                 'oz_tables': {k: v.get('title') for k, v in OZ_TABLES.items()},
                 'oz_fields': {t: [{'k': c['k'], 't': c.get('t') or c['k']} for c in (v.get('cols') or [])]
@@ -3159,6 +3365,31 @@ def docs_push(data, user):
     by_reg = {}
     for m in maps:
         by_reg.setdefault(m.get('registry'), []).append(m)
+    # Пакетный резолв представлений ссылок (GUID → имя/№ объекта): в колонки
+    # реестров должны уходить пользовательские значения, а не GUID. Резолвим
+    # только те реквизиты, которые реально сопоставлены с колонками реестра;
+    # при недоступной 1С остаётся исходное значение из хранилища.
+    src_fields = {str(m.get('src_field') or '') for m in maps} - {''}
+    resolved_by_doc = {}
+    need_resolve = []
+    for doc in docs:
+        fmap = doc_ref_guids(doc.get('fields') or {})
+        if any(f in src_fields for f in fmap):
+            need_resolve.append(doc)
+    if need_resolve:
+        srcrec = None
+        sid0 = str(need_resolve[0].get('source') or '')
+        try:
+            s0 = src_find(sid0)
+            if s0 and s0.get('transport') == 'odata':
+                srcrec = _src_odata_rec(s0)
+        except Exception:
+            srcrec = None
+        if srcrec is not None:
+            try:
+                resolved_by_doc = doc_refs_map(srcrec, need_resolve)
+            except Exception:
+                resolved_by_doc = {}
     entry = {'at': datetime.now().isoformat(timespec='seconds'), 'dry': dry, 'doc_type': doc_type,
              'read': 0, 'matched': 0, 'changed': 0, 'skipped': 0, 'errors': [], 'preview': []}
     for reg, rows in by_reg.items():
@@ -3166,7 +3397,8 @@ def docs_push(data, user):
         for doc in docs:
             entry['read'] += 1
             fields = doc.get('fields') or {}
-            key = str(fields.get(key_src) or '').strip()
+            res = resolved_by_doc.get(doc.get('uid')) or {}
+            key = str(res.get(key_src) or fields.get(key_src) or '').strip()
             if not key:
                 entry['skipped'] += 1
                 continue
@@ -3174,7 +3406,8 @@ def docs_push(data, user):
             for m in rows:
                 if nkey(m.get('reg_field')) == nkey(reg_key):
                     continue                        # ключевую колонку не перезаписываем
-                v = fields.get(m.get('src_field'))
+                sf = m.get('src_field')
+                v = res.get(sf) or fields.get(sf)   # представление вместо GUID
                 if v not in (None, ''):
                     updates[m['reg_field']] = v
             if not updates:
@@ -18459,7 +18692,17 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   // ЗАГРУЗКА ДОКУМЕНТОВ ИЗ 1С (внутренние документы) — только админ
   // =====================================================================
   var DOCS = { types: [], list: [], items: [], total: 0, checked: {}, active: '' };
+  var IDOC_NAMES = {};   // guid вида (нижн. рег.) → понятное имя; загружается из /api/docs/type_names
   var DMAP = { items: [], registries: [], oaoCols: [], ozTables: {}, ozFields: {}, ovrkFields: [] };
+
+  function doclLoadTypeNames() {
+    var sid = $('doclSource').value;
+    if (!sid) { IDOC_NAMES = {}; return Promise.resolve({}); }
+    return api('/api/docs/type_names', { source: sid }).then(function (r) {
+      if (r && r.ok) IDOC_NAMES = r.names || {};
+      return IDOC_NAMES;
+    });
+  }
 
   function doclSourceFill() {
     var sel = $('doclSource'); if (!sel) return;
@@ -18484,7 +18727,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   function doclSetActive(name) {
     DOCS.active = name || '';
     var sel = $('doclType');
-    sel.innerHTML = DOCS.types.map(function (t) { return '<option value="' + esc(t.name) + '">' + esc(t.name) + '</option>'; }).join('');
+    sel.innerHTML = DOCS.types.map(function (t) { return '<option value="' + esc(t.name) + '">' + esc(docTypeLabel(t.name, t)) + '</option>'; }).join('');
     sel.value = DOCS.active;
     $('doclKindRename').hidden = !DOCS.active.startsWith('IDOC:');
     Array.prototype.forEach.call($('doclTypes').querySelectorAll('[data-dt-row]'), function (row) {
@@ -18753,7 +18996,22 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
           '<button class="btn sm" data-dmapdel="' + esc(m.id) + '">✕</button></td></tr>';
       }).join('') : '<tr><td colspan="5" class="empty">Сопоставлений реквизитов пока нет — нажмите «+ Сопоставление реквизита».</td></tr>') + '</tbody>';
   }
-  function docTypeLabel(name) {
+  function docTypeLabel(name, d) {
+    // 1) понятное имя из самой записи (doc_type_label — серверный кэш видов),
+    //    чтобы тип не превращался в GUID, когда список типов источника пуст;
+    // 2) список типов DOCS.types; 3) крайний случай — «внутренний документ».
+    var lbl = (d && d.doc_type_label) || '';
+    if (!lbl && DMAP.items.length) {
+      for (var i = 0; i < DMAP.items.length; i++) {
+        if (DMAP.items[i].doc_type === name && DMAP.items[i].doc_type_label) {
+          lbl = DMAP.items[i].doc_type_label; break;
+        }
+      }
+    }
+    if (!lbl && String(name).indexOf('IDOC:') === 0) {
+      lbl = IDOC_NAMES[String(name).slice(5).toLowerCase()] || '';
+    }
+    if (lbl) return String(name).indexOf('IDOC:') === 0 ? lbl + ' (внутренний документ)' : lbl;
     var t = DOCS.types.filter(function (x) { return x.name === name; })[0];
     if (t && t.kind === 'внутренний документ') return t.label + ' (внутренний документ)';
     return name;
