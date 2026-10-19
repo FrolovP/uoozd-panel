@@ -2258,9 +2258,18 @@ DOCS_PAGE = 500               # строк на страницу чтения и
 DOCS_MAX = 5000               # максимум документов за одну загрузку
 
 _DOC_GUID_KEYS = ('Ref_Key', 'RefKey', 'GUID', 'Ссылка', 'ID', 'id')
-_DOC_NUM_KEYS = ('Number', 'Номер', 'number')
-_DOC_DATE_KEYS = ('Date', 'Дата', 'date')
+_DOC_NUM_KEYS = ('Number', 'Номер', 'number', 'РегистрационныйНомер', 'Code')
+_DOC_DATE_KEYS = ('Date', 'Дата', 'date', 'ДатаРегистрации', 'ДатаСоздания')
 _DOC_POSTED_KEYS = ('Posted', 'Проведен', 'Проведён', 'posted')
+
+# Внутренние документы 1С:Документооборот. Ссылка вида
+# e1cib/data/Справочник.ВнутренниеДокументы?ref=<GUID> показывает: документы
+# лежат в справочнике «ВнутренниеДокументы» (OData: Catalog_ВнутренниеДокументы),
+# а «тип» документа («Заявка на закупку», «Заявка на потребность», «Протокол»…) —
+# это значение реквизита «ВидДокумента» (ссылка на справочник видов).
+IDOC_PREFIX = 'IDOC:'                 # тип в списках панели: IDOC:<GUID вида документа>
+IDOC_ENTITY = 'Catalog_ВнутренниеДокументы'
+IDOC_KINDS_ENTITY = 'Catalog_ВидыВнутреннихДокументов'
 
 
 def docs_load_raw():
@@ -2296,6 +2305,39 @@ def _doc_guess_date_field(props):
     return ''
 
 
+def idoc_types(rec, sets):
+    """Виды внутренних документов (1С:Документооборот) как типы для загрузки →
+    [{'name': 'IDOC:<GUID вида>', 'label', 'kind': 'внутренний документ', 'date_field'}].
+    Если база не ДО или справочник видов не опубликован — пусто, ничего не ломается."""
+    names = {s.get('name') for s in sets or []}
+    if IDOC_ENTITY not in names or IDOC_KINDS_ENTITY not in names:
+        return []
+    props = next((s.get('props') for s in sets if s.get('name') == IDOC_ENTITY), [])
+    names_p = [x.get('name') for x in props or [] if x.get('name')]
+    date_field = ''
+    for want in ('ДатаРегистрации', 'ДатаСоздания'):
+        if want in names_p:
+            date_field = want
+            break
+    if not date_field:
+        date_field = _doc_guess_date_field(props)
+    try:
+        q = odata_query(_src_odata_rec(rec), entity=IDOC_KINDS_ENTITY, top=500)
+    except ValueError:
+        return []                       # видов не прочитать (прав нет) — просто не предлагаем их
+    rows = [dict(zip(q['columns'], r)) for r in q['rows']]
+    out = []
+    for r in rows:
+        if str(r.get('DeletionMark') or '').lower() in ('true', 'да') \
+                or str(r.get('IsFolder') or '').lower() in ('true', 'да'):
+            continue
+        key, desc = str(r.get('Ref_Key') or '').strip(), str(r.get('Description') or '').strip()
+        if key and desc:
+            out.append({'name': IDOC_PREFIX + key, 'label': desc,
+                        'kind': 'внутренний документ', 'date_field': date_field})
+    return sorted(out, key=lambda x: x['label'])
+
+
 def doc_types(rec):
     """Типы документов источника → [{'name','label','kind','date_field'}]."""
     t = rec.get('transport')
@@ -2304,9 +2346,14 @@ def doc_types(rec):
         probe = {'base': p.get('base'), 'login': p.get('login'), 'password': p.get('password'),
                  'ignore_cert': p.get('ignore_cert')}
         sets = odata_service_info(probe)
-        return [{'name': s.get('name') or '', 'label': (s.get('name') or '').split('_', 1)[-1],
-                 'kind': _doc_kind(s.get('name')), 'date_field': _doc_guess_date_field(s.get('props'))}
-                for s in sets if s.get('name')]
+        out = [{'name': s.get('name') or '', 'label': (s.get('name') or '').split('_', 1)[-1],
+                'kind': _doc_kind(s.get('name')), 'date_field': _doc_guess_date_field(s.get('props'))}
+               for s in sets if s.get('name')]
+        try:
+            out += idoc_types(rec, sets)
+        except Exception:
+            pass                        # виды внутренних документов — опция, не обязательная
+        return out
     if t == 'com':
         raise ValueError('Транспорт прямого COM удалён из панели — пересоздайте источник на OData или MCP')
     obj = str(p.get('metadata_object') or '').strip()
@@ -2352,12 +2399,17 @@ def _doc_normalize(raw, rec, doc_type, actor_at):
 
 
 def docs_fetch(rec, doc_type, date_from, date_to, date_field, limit=DOCS_MAX):
-    """Чтение документов одного типа за период → список словарей (сырые строки)."""
+    """Чтение документов одного типа за период → список словарей (сырые строки).
+    Тип 'IDOC:<GUID вида>' — внутренний документ 1С:ДО: читается справочник
+    «ВнутренниеДокументы» с фильтром по реквизиту «ВидДокумента»."""
     t = rec.get('transport')
     p = rec.get('params') or {}
     cap = max(1, min(int(limit or DOCS_MAX), DOCS_MAX))
     if t == 'odata':
-        cond = []
+        entity, cond = doc_type, []
+        if doc_type.startswith(IDOC_PREFIX):
+            entity = IDOC_ENTITY
+            cond.append(f"ВидДокумента_Key eq guid'{doc_type[len(IDOC_PREFIX):]}'")
         if date_field and date_from:
             cond.append(f"{date_field} ge datetime'{date_from}T00:00:00'")
         if date_field and date_to:
@@ -2366,7 +2418,7 @@ def docs_fetch(rec, doc_type, date_from, date_to, date_field, limit=DOCS_MAX):
         orderby = f'{date_field} desc' if date_field else None
         out, skip = [], 0
         while len(out) < cap:
-            q = odata_query(_src_odata_rec(rec), entity=doc_type, filt=filt, orderby=orderby,
+            q = odata_query(_src_odata_rec(rec), entity=entity, filt=filt, orderby=orderby,
                             top=min(DOCS_PAGE, cap - len(out)), skip=skip)
             batch = [dict(zip(q['columns'], r)) for r in q['rows']]
             if not batch:
@@ -2414,11 +2466,12 @@ def docs_api(path, data, user):
             p = rec.get('params') or {}
             probe = {'base': p.get('base'), 'login': p.get('login'), 'password': p.get('password'),
                      'ignore_cert': p.get('ignore_cert')}
+            ent = IDOC_ENTITY if doc_type.startswith(IDOC_PREFIX) else doc_type
             for s in odata_service_info(probe):
-                if s.get('name') == doc_type:
+                if s.get('name') == ent:
                     return {'ok': True, 'fields': [{'name': x.get('name'), 'label': x.get('name')}
                                                    for x in (s.get('props') or []) if x.get('name')]}
-            raise ValueError(f'Набор «{doc_type}» не найден в $metadata источника')
+            raise ValueError(f'Набор «{ent}» не найден в $metadata источника')
         return {'ok': True, 'fields': src_fields(rec)}
     if path == '/api/docs/load':
         rec = src_find(str(data.get('source') or ''))
@@ -18030,10 +18083,12 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       if (!res.ok) { sel.innerHTML = '<option value="">— ошибка —</option>'; warnIn('doclWarn', 'err', esc(res.message)); return; }
       warnIn('doclWarn', '', '');
       DOCS.types = res.types || [];
-      var docs = DOCS.types.filter(function (t) { return t.kind === 'документ'; });
+      var docs = DOCS.types.filter(function (t) { return t.kind === 'документ' || t.kind === 'внутренний документ'; });
       var list = docs.length ? docs : DOCS.types;
       sel.innerHTML = '<option value="">— выберите тип документа —</option>' + list.map(function (t) {
-        return '<option value="' + esc(t.name) + '">' + esc(t.name) + (t.kind !== 'документ' ? ' (' + esc(t.kind) + ')' : '') + (t.date_field ? ' · дата: ' + esc(t.date_field) : '') + '</option>';
+        var txt = t.kind === 'внутренний документ' ? t.label + ' (внутренний документ)'
+          : t.name + (t.kind !== 'документ' ? ' (' + t.kind + ')' : '');
+        return '<option value="' + esc(t.name) + '">' + esc(txt) + (t.date_field ? ' · дата: ' + esc(t.date_field) : '') + '</option>';
       }).join('');
     });
   }
@@ -18058,7 +18113,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       $('doclInfo').textContent = DOCS.total ? ('Во внутреннем хранилище по фильтру: ' + DOCS.total + ' (показано до ' + DOCS.items.length + ')') : '';
       $('doclTable').innerHTML = '<thead><tr><th>Тип документа</th><th>Номер</th><th>Дата</th><th>Проведён</th><th>Полей</th><th>Загружен</th><th></th></tr></thead><tbody>' +
         (DOCS.items.length ? DOCS.items.map(function (d) {
-          return '<tr><td class="l">' + esc(d.doc_type) + '</td><td>' + esc(d.number || '—') + '</td><td>' + esc(d.date || '—') + '</td>' +
+          return '<tr><td class="l">' + esc(docTypeLabel(d.doc_type)) + '</td><td>' + esc(d.number || '—') + '</td><td>' + esc(d.date || '—') + '</td>' +
             '<td>' + (d.posted ? '<span class="pill ok">да</span>' : 'нет') + '</td><td>' + (d.fields_count || 0) + '</td>' +
             '<td class="muted">' + esc((d.loaded_at || '').replace('T', ' ')) + '</td>' +
             '<td><button class="btn sm" data-docdel="' + esc(d.doc_type) + '|' + esc(d.uid) + '">✕</button></td></tr>';
@@ -18089,17 +18144,22 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   function renderDmapTable() {
     $('dmapTable').innerHTML = '<thead><tr><th>Тип документа 1С</th><th>Реквизит документа 1С</th><th>Тип реестра панели</th><th>Реквизит реестра панели</th><th></th></tr></thead><tbody>' +
       (DMAP.items.length ? DMAP.items.map(function (m) {
-        return '<tr><td class="l"><b>' + esc(m.doc_type) + '</b></td><td class="l">' + esc(m.src_field) + '</td>' +
+        return '<tr><td class="l"><b>' + esc(docTypeLabel(m.doc_type)) + '</b></td><td class="l">' + esc(m.src_field) + '</td>' +
           '<td><span class="pill">' + esc(m.registry) + '</span></td><td class="l">' + esc(m.reg_field) + '</td>' +
           '<td style="white-space:nowrap"><button class="btn sm" data-dmapedit="' + esc(m.id) + '">Изменить</button> ' +
           '<button class="btn sm" data-dmapdel="' + esc(m.id) + '">✕</button></td></tr>';
       }).join('') : '<tr><td colspan="5" class="empty">Сопоставлений реквизитов пока нет — нажмите «+ Сопоставление реквизита».</td></tr>') + '</tbody>';
   }
+  function docTypeLabel(name) {
+    var t = DOCS.types.filter(function (x) { return x.name === name; })[0];
+    if (t && t.kind === 'внутренний документ') return t.label + ' (внутренний документ)';
+    return name;
+  }
   function dmapTypeOptions(cur) {
-    var names = DOCS.types.map(function (t) { return t.name; });
-    if (cur && names.indexOf(cur) < 0) names.unshift(cur);
-    return '<option value="">— выберите тип —</option>' + names.map(function (n) {
-      return '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>';
+    var items = DOCS.types.map(function (t) { return { name: t.name, txt: docTypeLabel(t.name) }; });
+    if (cur && !items.some(function (x) { return x.name === cur; })) items.unshift({ name: cur, txt: cur });
+    return '<option value="">— выберите тип —</option>' + items.map(function (x) {
+      return '<option value="' + esc(x.name) + '"' + (x.name === cur ? ' selected' : '') + '>' + esc(x.txt) + '</option>';
     }).join('');
   }
   function dmapLoadFields(cur) {
@@ -18200,7 +18260,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     var dt = $('doclType').value;
     if (!dt) { warnIn('doclWarn', 'err', 'Сначала выберите тип документа и загрузите документы из 1С.'); return; }
     warnIn('dpmWarn', '', '');
-    $('dpmSub').textContent = 'тип документа: ' + dt + ' · в хранилище: ' + (DOCS.total || DOCS.items.length || 0);
+    $('dpmSub').textContent = 'тип документа: ' + docTypeLabel(dt) + ' · в хранилище: ' + (DOCS.total || DOCS.items.length || 0);
     var reg = $('dpmReg');
     reg.innerHTML = '<option value="">все, для которых есть сопоставление</option>' +
       DMAP.registries.map(function (r) { return '<option value="' + esc(r) + '">' + esc(r) + '</option>'; }).join('');
