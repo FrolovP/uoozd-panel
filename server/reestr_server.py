@@ -2270,6 +2270,26 @@ _DOC_POSTED_KEYS = ('Posted', 'Проведен', 'Проведён', 'posted')
 IDOC_PREFIX = 'IDOC:'                 # тип в списках панели: IDOC:<GUID вида документа>
 IDOC_ENTITY = 'Catalog_ВнутренниеДокументы'
 IDOC_KINDS_ENTITY = 'Catalog_ВидыВнутреннихДокументов'
+ФАЙЛ_ВИДЫ_1С = 'Панель — виды документов 1С.json'   # GUID вида → понятное имя (когда справочник видов не опубликован)
+
+
+def idoc_names():
+    d = _json_file(ФАЙЛ_ВИДЫ_1С, {})
+    return d if isinstance(d, dict) else {}
+
+
+def idoc_set_name(key, label, actor=''):
+    if not re.fullmatch(r'[0-9a-fA-F-]{36}', key or ''):
+        raise ValueError('Некорректный GUID вида документа')
+    label = str(label or '').strip()
+    with STORE_LOCK:
+        d = idoc_names()
+        if label:
+            d[key.lower()] = label[:120]
+        else:
+            d.pop(key.lower(), None)
+        write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ВИДЫ_1С, json.dumps(d, ensure_ascii=False, indent=1))
+    log('edit', f'Вид документа 1С {key[:8]}… → «{label or "без имени"}»', user=actor or 'панель')
 
 
 def docs_load_raw():
@@ -2308,9 +2328,11 @@ def _doc_guess_date_field(props):
 def idoc_types(rec, sets):
     """Виды внутренних документов (1С:Документооборот) как типы для загрузки →
     [{'name': 'IDOC:<GUID вида>', 'label', 'kind': 'внутренний документ', 'date_field'}].
-    Если база не ДО или справочник видов не опубликован — пусто, ничего не ломается."""
+    Основной путь — справочник «ВидыВнутреннихДокументов»; если он не опубликован
+    в OData, виды собираются из самих документов (последние 1000), имена — из
+    локального словаря псевдонимов («Панель — виды документов 1С.json»)."""
     names = {s.get('name') for s in sets or []}
-    if IDOC_ENTITY not in names or IDOC_KINDS_ENTITY not in names:
+    if IDOC_ENTITY not in names:
         return []
     props = next((s.get('props') for s in sets if s.get('name') == IDOC_ENTITY), [])
     names_p = [x.get('name') for x in props or [] if x.get('name')]
@@ -2321,20 +2343,39 @@ def idoc_types(rec, sets):
             break
     if not date_field:
         date_field = _doc_guess_date_field(props)
+    alias = idoc_names()
+    if IDOC_KINDS_ENTITY in names:
+        try:
+            q = odata_query(_src_odata_rec(rec), entity=IDOC_KINDS_ENTITY, top=500)
+        except ValueError:
+            return []                   # видов не прочитать (прав нет) — просто не предлагаем их
+        rows = [dict(zip(q['columns'], r)) for r in q['rows']]
+        out = []
+        for r in rows:
+            if str(r.get('DeletionMark') or '').lower() in ('true', 'да') \
+                    or str(r.get('IsFolder') or '').lower() in ('true', 'да'):
+                continue
+            key, desc = str(r.get('Ref_Key') or '').strip(), str(r.get('Description') or '').strip()
+            if key and desc:
+                out.append({'name': IDOC_PREFIX + key,
+                            'label': alias.get(key.lower()) or desc,
+                            'kind': 'внутренний документ', 'date_field': date_field})
+        return sorted(out, key=lambda x: x['label'])
+    # --- fallback: справочник видов не опубликован — виды из самих документов ---
     try:
-        q = odata_query(_src_odata_rec(rec), entity=IDOC_KINDS_ENTITY, top=500)
+        q = odata_query(_src_odata_rec(rec), entity=IDOC_ENTITY, orderby='ДатаСоздания desc', top=1000)
     except ValueError:
-        return []                       # видов не прочитать (прав нет) — просто не предлагаем их
-    rows = [dict(zip(q['columns'], r)) for r in q['rows']]
-    out = []
-    for r in rows:
-        if str(r.get('DeletionMark') or '').lower() in ('true', 'да') \
-                or str(r.get('IsFolder') or '').lower() in ('true', 'да'):
-            continue
-        key, desc = str(r.get('Ref_Key') or '').strip(), str(r.get('Description') or '').strip()
-        if key and desc:
-            out.append({'name': IDOC_PREFIX + key, 'label': desc,
-                        'kind': 'внутренний документ', 'date_field': date_field})
+        return []
+    seen = {}
+    for r in (dict(zip(q['columns'], row)) for row in q['rows']):
+        k = str(r.get('ВидДокумента_Key') or '').strip().lower()
+        if k:
+            seen[k] = seen.get(k, 0) + 1
+    out = [{'name': IDOC_PREFIX + k,
+            'label': alias.get(k) or f'Вид {k[:8]}…',
+            'kind': 'внутренний документ', 'date_field': date_field,
+            'count': n, 'unnamed': k not in alias}
+           for k, n in seen.items()]
     return sorted(out, key=lambda x: x['label'])
 
 
@@ -2407,9 +2448,13 @@ def docs_fetch(rec, doc_type, date_from, date_to, date_field, limit=DOCS_MAX):
     cap = max(1, min(int(limit or DOCS_MAX), DOCS_MAX))
     if t == 'odata':
         entity, cond = doc_type, []
+        idoc_key = ''
         if doc_type.startswith(IDOC_PREFIX):
             entity = IDOC_ENTITY
-            cond.append(f"ВидДокумента_Key eq guid'{doc_type[len(IDOC_PREFIX):]}'")
+            idoc_key = doc_type[len(IDOC_PREFIX):].lower()
+            # Серверный фильтр по ВидДокумента_Key НЕ добавляем: часть редакций 1С
+            # отвечает 500 на сравнение ссылки с guid-литералом. Фильтруем по виду
+            # на стороне панели (серверный фильтр — только период по дате).
         if date_field and date_from:
             cond.append(f"{date_field} ge datetime'{date_from}T00:00:00'")
         if date_field and date_to:
@@ -2418,16 +2463,21 @@ def docs_fetch(rec, doc_type, date_from, date_to, date_field, limit=DOCS_MAX):
         orderby = f'{date_field} desc' if date_field else None
         out, skip = [], 0
         while len(out) < cap:
+            page = min(DOCS_PAGE, cap)
             q = odata_query(_src_odata_rec(rec), entity=entity, filt=filt, orderby=orderby,
-                            top=min(DOCS_PAGE, cap - len(out)), skip=skip)
+                            top=page, skip=skip)
             batch = [dict(zip(q['columns'], r)) for r in q['rows']]
             if not batch:
                 break
+            raw_len = len(batch)
+            skip += raw_len
+            if idoc_key:
+                batch = [r for r in batch
+                         if str(r.get('ВидДокумента_Key') or '').strip().lower() == idoc_key]
             out.extend(batch)
-            if len(batch) < min(DOCS_PAGE, cap):
+            if raw_len < page:
                 break
-            skip += len(batch)
-        return out
+        return out[:cap]
     if t == 'com':
         raise ValueError('Транспорт прямого COM удалён из панели — пересоздайте источник на OData или MCP')
     args = {}
@@ -2544,6 +2594,10 @@ def docs_api(path, data, user):
         left = [r for r in rows if not (r.get('uid') == uid and (not dt or r.get('doc_type') == dt))]
         docs_save_raw(left)
         return {'ok': True, 'removed': len(rows) - len(left)}
+    if path == '/api/docs/kind_name':
+        idoc_set_name(str(data.get('key') or ''), str(data.get('label') or ''),
+                      user.get('fio') or 'панель')
+        return {'ok': True}
     if path == '/api/docs/push':
         return docs_push(data, user)
     raise ValueError('Нет такой команды документов 1С')
@@ -12163,6 +12217,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <div class="toolbar" style="flex-wrap:wrap;gap:8px">
       <label class="muted" for="doclSource">Источник</label><select id="doclSource"></select>
       <label class="muted" for="doclType">Тип документа</label><select id="doclType" style="min-width:240px"></select>
+      <button class="btn sm" id="doclKindRename" title="Задать понятное имя для вида внутреннего документа" hidden>✎</button>
       <label class="muted" for="doclFrom">с</label><input type="date" id="doclFrom">
       <label class="muted" for="doclTo">по</label><input type="date" id="doclTo">
       <span class="grow"></span>
@@ -18093,6 +18148,21 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     });
   }
   $('doclSource').onchange = doclLoadTypes;
+  $('doclType').onchange = function () {
+    var v = this.value;
+    $('doclKindRename').hidden = !v.startsWith('IDOC:');
+  };
+  $('doclKindRename').onclick = function () {
+    var v = $('doclType').value;
+    if (!v.startsWith('IDOC:')) return;
+    var t = DOCS.types.filter(function (x) { return x.name === v; })[0] || {};
+    var label = prompt('Понятное имя вида документа\n' + v.slice(5) + '\n(пустое — сбросить):', t.label || '');
+    if (label === null) return;
+    api('/api/docs/kind_name', { key: v.slice(5), label: label.trim() }).then(function (res) {
+      if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
+      toast('Имя вида сохранено'); doclLoadTypes();
+    });
+  };
   $('doclRun').onclick = function () {
     var sid = $('doclSource').value, dt = $('doclType').value;
     if (!sid) { warnIn('doclWarn', 'err', 'Выберите источник данных 1С.'); return; }
