@@ -1642,15 +1642,25 @@ def odata_service_info(rec):
             for es in (et.get('entitySets') or []):
                 props = [{'name': p.get('name'), 'type': _odata_meta_type(p.get('type')), 'nullable': p.get('nullable', True)}
                          for p in (et.get('properties') or [])]
+                navs = [{'name': p.get('name'), 'type': _odata_nav_target(p.get('type'))}
+                        for p in (et.get('navigationProperties') or [])]
                 keys = ((et.get('keys') or [{}])[0].get('name') or '').split(',') if et.get('keys') else []
                 sets.append({'name': es.get('name'), 'type': et.get('name'), 'props': props,
-                             'keys': [k for k in keys if k]})
+                             'keys': [k for k in keys if k], 'navs': navs})
     sets.sort(key=lambda x: (x.get('name') or '').lower())
     return sets
 
 
+def _odata_nav_target(t):
+    """Тип NavigationProperty → имя целевого набора OData."""
+    t = str(t or '')
+    if t.startswith('Collection('):
+        t = t[len('Collection('):-1]
+    return t.rsplit('.', 1)[-1]
+
+
 def _odata_metadata_xml(payload):
-    """CSDL/XML ($metadata 1С) → [{'name','type','props','keys'}]."""
+    """CSDL/XML ($metadata 1С) → [{'name','type','props','keys','navs'}]."""
     def local(tag):
         return tag.rsplit('}', 1)[-1]
 
@@ -1668,7 +1678,9 @@ def _odata_metadata_xml(payload):
             props = [{'name': p.get('Name'), 'type': _odata_meta_type(p.get('Type')),
                       'nullable': str(p.get('Nullable', 'true')).lower() != 'false'}
                      for p in node if local(p.tag) == 'Property']
-            types[name] = {'type': name, 'props': props, 'keys': [k for k in keys if k]}
+            navs = [{'name': p.get('Name'), 'type': _odata_nav_target(p.get('Type'))}
+                    for p in node if local(p.tag) == 'NavigationProperty']
+            types[name] = {'type': name, 'props': props, 'keys': [k for k in keys if k], 'navs': navs}
         elif t == 'EntitySet':
             et = types.get(str(node.get('EntityType') or '').rsplit('.', 1)[-1])
             if et is not None:
@@ -2320,6 +2332,147 @@ def dtype_cache_put(src_id, types):
         write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ТИПЫ_1С, json.dumps(d, ensure_ascii=False, indent=1))
 
 
+# --- Представления ссылок 1С: GUID → пользовательское значение ---------------
+ФАЙЛ_GUID_1С = 'Панель — представления GUID 1С.json'
+_GUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+_GUID_EMPTY = '00000000-0000-0000-0000-000000000000'
+_PRESENT_KEYS = ('Description', 'Наименование', 'Name', 'FullName', 'ПолнНаименование', 'Заголовок', 'Title')
+
+
+def guid_cache():
+    d = _json_file(ФАЙЛ_GUID_1С, {})
+    return d if isinstance(d, dict) else {}
+
+
+def guid_cache_put(entity, guid, text):
+    with STORE_LOCK:
+        d = guid_cache()
+        d[f'{entity}|{guid.lower()}'] = str(text)[:300]
+        if len(d) > 20000:              # защита от распухания кэша
+            d = dict(list(d.items())[-15000:])
+        write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_GUID_1С, json.dumps(d, ensure_ascii=False, indent=1))
+
+
+def odata_nav_map(rec, entity):
+    """Реквизит-ссылка → целевой набор OData (по NavigationProperty из $metadata)."""
+    for s in odata_service_info(rec):
+        if s.get('name') == entity:
+            return {n['name']: n['type'] for n in (s.get('navs') or []) if n.get('name') and n.get('type')}
+    return {}
+
+
+def guid_present(rec, entity, guid):
+    """GUID ссылки → пользовательское представление объекта (с постоянным кэшем)."""
+    key = f'{entity}|{guid.lower()}'
+    cached = guid_cache()
+    if key in cached:
+        return cached[key]
+    text = ''
+    try:
+        j = _odata_http_get(rec['base'] + quote(entity, safe='') +
+                            "(guid'" + guid + "')?$format=json", rec)
+        for k in _PRESENT_KEYS:
+            if j.get(k) not in (None, ''):
+                text = str(j.get(k))
+                break
+        if not text:
+            num = str(j.get('Number') or j.get('РегистрационныйНомер') or '').strip()
+            dat = _doc_date_iso(j.get('Date') or j.get('ДатаРегистрации'))
+            if num:
+                text = '№' + num + (f' от {dat}' if dat else '')
+            elif j.get('Code') not in (None, ''):
+                text = str(j.get('Code'))
+    except Exception:
+        return ''                       # сеть/права/удалённый объект — не кэшируем, попробуем позже
+    if text:
+        guid_cache_put(entity, guid, text)
+    return text
+
+
+# Типовые соответствия «реквизит-ссылка → набор OData» для 1С:Документооборот
+# и типовых конфигураций. Используются, когда в $metadata нет NavigationProperty.
+IDOC_REF_HINTS = {
+    'ВидДокумента': 'Catalog_ВидыВнутреннихДокументов',
+    'Организация': 'Catalog_Организации',
+    'Подразделение': 'Catalog_СтруктураПредприятия',
+    'Ответственный': 'Catalog_Пользователи',
+    'ОтветственныйЗаХранение': 'Catalog_Пользователи',
+    'Автор': 'Catalog_Пользователи',
+    'Пользователь': 'Catalog_Пользователи',
+    'Подготовил': 'Catalog_Пользователи',
+    'Согласовал': 'Catalog_Пользователи',
+    'Утвердил': 'Catalog_Пользователи',
+    'Инициатор': 'Catalog_Пользователи',
+    'Контрагент': 'Catalog_Контрагенты',
+    'Валюта': 'Catalog_Валюты',
+}
+
+ФАЙЛ_СПРАВ_ССЫЛОК_1С = 'Панель — справочники ссылок 1С.json'   # источник → {реквизит: набор OData}
+
+
+def reflink_map(src_id):
+    d = _json_file(ФАЙЛ_СПРАВ_ССЫЛОК_1С, {})
+    m = (d.get(str(src_id)) if isinstance(d, dict) else None)
+    return m if isinstance(m, dict) else {}
+
+
+def reflink_learn(src_id, field, entity):
+    """Запомнить удачное соответствие реквизит→набор, чтобы не угадывать снова."""
+    with STORE_LOCK:
+        d = _json_file(ФАЙЛ_СПРАВ_ССЫЛОК_1С, {})
+        if not isinstance(d, dict):
+            d = {}
+        m = d.setdefault(str(src_id), {})
+        if m.get(field) != entity:
+            m[field] = entity
+            write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_СПРАВ_ССЫЛОК_1С,
+                         json.dumps(d, ensure_ascii=False, indent=1))
+
+
+def resolve_doc_refs(rec, doc_type, fields):
+    """{реквизит_Key: представление} для GUID-значений реквизитов документа.
+    Целевой набор: NavigationProperty $metadata → выученные соответствия →
+    типовой словарь → Catalog_<имя реквизита>; вид документа ДО — из локального
+    словаря псевдонимов без запроса."""
+    ent = IDOC_ENTITY if str(doc_type).startswith(IDOC_PREFIX) else str(doc_type)
+    ref_fields = {k[:-4]: str(v) for k, v in (fields or {}).items()
+                  if k.endswith('_Key') and k != 'Ref_Key'
+                  and _GUID_RE.match(str(v or '')) and str(v).lower() != _GUID_EMPTY}
+    if not ref_fields:
+        return {}
+    try:
+        sets = odata_service_info(rec)
+    except Exception:
+        return {}
+    set_names = {s.get('name') for s in sets}
+    navs = {}
+    for s in sets:
+        if s.get('name') == ent:
+            navs = {n['name']: n['type'] for n in (s.get('navs') or [])
+                    if n.get('name') and n.get('type')}
+            break
+    learned = reflink_map(rec.get('id'))
+    aliases = idoc_names()
+    out = {}
+    for base, guid in ref_fields.items():
+        if base == 'ВидДокумента' and guid.lower() in aliases:
+            out[base + '_Key'] = aliases[guid.lower()]
+            continue
+        known = navs.get(base) or learned.get(base)
+        candidates = [known] if known else \
+            [c for c in (IDOC_REF_HINTS.get(base), f'Catalog_{base}') if c]
+        for cand in candidates:
+            if cand not in set_names:
+                continue
+            txt = guid_present(rec, cand, guid)
+            if txt:
+                out[base + '_Key'] = txt
+                if not known:
+                    reflink_learn(rec.get('id'), base, cand)
+                break
+    return out
+
+
 def _doc_kind(set_name):
     n = str(set_name or '')
     if n.startswith('Document_'):
@@ -2627,7 +2780,15 @@ def docs_api(path, data, user):
         dt = str(data.get('doc_type') or '').strip()
         for r in docs_load_raw():
             if r.get('uid') == uid and (not dt or r.get('doc_type') == dt):
-                return {'ok': True, 'item': r}
+                resolved = {}
+                sr = src_find(r.get('source') or '')
+                if sr and sr.get('transport') == 'odata':
+                    try:
+                        resolved = resolve_doc_refs(_src_odata_rec(sr),
+                                                    r.get('doc_type') or '', r.get('fields') or {})
+                    except Exception:
+                        resolved = {}   # 1С недоступна — форма покажет исходные значения
+                return {'ok': True, 'item': r, 'resolved': resolved}
         raise ValueError('Документ не найден во внутреннем хранилище')
     if path == '/api/docs/delete':
         uid = str(data.get('uid') or '')
@@ -12689,7 +12850,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   <div class="sheet" style="width:min(1040px,100%)">
     <div class="sheet-head"><h2 id="dsmTitle">Документ-образец</h2><span class="muted" id="dsmSub"></span><button class="btn x" data-close="dsm" aria-label="Закрыть">✕</button></div>
     <div class="warnbox" id="dsmWarn"></div>
-    <div style="padding:10px 22px 0"><div class="hint">Выберите для реквизитов документа реестр панели и его реквизит — так сопоставление создаётся по живому документу. «+» — переносить один реквизит сразу в несколько реестров. Если для одного типа документа сопоставлено несколько реестров, их строки синхронизируются между собой по GUID документа 1С. Зелёным отмечены реквизиты, для которых сопоставление уже задано.</div></div>
+    <div style="padding:10px 22px 0"><div class="hint">Выберите для реквизитов документа реестр панели и его реквизит — так сопоставление создаётся по живому документу. Реквизиты-ссылки показаны пользовательскими представлениями — панель запрашивает их из 1С по GUID (в подсказке ячейки виден и сам GUID). «+» — переносить один реквизит сразу в несколько реестров. Если для одного типа документа сопоставлено несколько реестров, их строки синхронизируются между собой по GUID документа 1С. Зелёным отмечены реквизиты, для которых сопоставление уже задано.</div></div>
     <div class="tablewrap" style="max-height:430px;overflow:auto;margin:10px 22px"><table class="at" id="dsmTable"></table></div>
     <div class="sheet-foot"><span class="grow"></span><button class="btn" data-close="dsm">Отмена</button><button class="btn primary" id="dsmSave">Сохранить сопоставления</button></div>
   </div>
@@ -18405,11 +18566,14 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   // =====================================================================
   // ДОКУМЕНТ-ОБРАЗЕЦ: сопоставление реквизитов по живому документу 1С
   // =====================================================================
-  var DSM = { doc: null };
+  var DSM = { doc: null, resolved: {} };
   function openDocSample(docType, uid) {
+    warnIn('doclWarn', '', '⏳ Открываю документ, запрашиваю представления ссылок из 1С…');
     api('/api/docs/get', { doc_type: docType, uid: uid }).then(function (res) {
       if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
+      warnIn('doclWarn', '', '');
       DSM.doc = res.item;
+      DSM.resolved = res.resolved || {};
       renderDocSample();
       openModal('dsm');
     });
@@ -18432,13 +18596,18 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       return '<option value="' + esc(h) + '"' + (h === cur ? ' selected' : '') + '>' + esc(h) + '</option>';
     }).join('');
   }
-  function dsmRowHtml(field, value, reg, rf, clone) {
+  function dsmRowHtml(field, value, reg, rf, clone, raw) {
+    var tip = (raw && raw !== value) ? (value + '  ·  ' + raw) : value;
     return '<tr data-dsm-row="' + esc(field) + '"' + (reg ? ' style="background:#f2fbf4"' : '') + '>' +
       '<td class="l"><b>' + esc(field) + '</b> <button class="btn sm" data-dsm-add title="Переносить этот реквизит ещё в один реестр">+</button>' +
       (clone ? ' <button class="btn sm" data-dsm-del title="Убрать строку">✕</button>' : '') + '</td>' +
-      '<td class="l muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(value) + '">' + esc(value || '—') + '</td>' +
+      '<td class="l muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(tip) + '">' + esc(value || '—') + '</td>' +
       '<td><select data-dsm-reg>' + dsmRegOptions(reg) + '</select></td>' +
       '<td><select data-dsm-rf>' + dsmRegFieldOptions(reg, rf) + '</select></td></tr>';
+  }
+  function dsmValue(f) {
+    var d = DSM.doc, raw = ((d.fields || {})[f] || '');
+    return { v: DSM.resolved[f] || raw, raw: raw };
   }
   function renderDocSample() {
     var d = DSM.doc;
@@ -18454,9 +18623,10 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     var names = Object.keys(d.fields || {}).sort(function (a, b) { return a.localeCompare(b, 'ru'); });
     var html = '';
     names.forEach(function (f) {
+      var val = dsmValue(f);
       var maps = by[f] || [];
-      if (!maps.length) html += dsmRowHtml(f, d.fields[f], '', '', false);
-      else maps.forEach(function (m, i) { html += dsmRowHtml(f, d.fields[f], m.registry, m.reg_field, i > 0); });
+      if (!maps.length) html += dsmRowHtml(f, val.v, '', '', false, val.raw);
+      else maps.forEach(function (m, i) { html += dsmRowHtml(f, val.v, m.registry, m.reg_field, i > 0, val.raw); });
     });
     $('dsmTable').innerHTML = '<thead><tr><th>Реквизит документа 1С</th><th>Данные документа</th><th>Реестр панели</th><th>Реквизит реестра</th></tr></thead><tbody>' +
       (html || '<tr><td colspan="4" class="empty">У документа нет реквизитов.</td></tr>') + '</tbody>';
@@ -18471,8 +18641,8 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   $('dsmTable').onclick = function (e) {
     var add = e.target.closest('[data-dsm-add]');
     if (add) {
-      var tr = add.closest('tr'), d = DSM.doc, f = tr.dataset.dsmRow;
-      tr.insertAdjacentHTML('afterend', dsmRowHtml(f, (d.fields || {})[f] || '', '', '', true));
+      var tr = add.closest('tr'), f = tr.dataset.dsmRow, val = dsmValue(f);
+      tr.insertAdjacentHTML('afterend', dsmRowHtml(f, val.v, '', '', true, val.raw));
       return;
     }
     var del = e.target.closest('[data-dsm-del]');
