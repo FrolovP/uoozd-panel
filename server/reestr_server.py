@@ -18711,6 +18711,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       return '<option value="' + esc(x.id) + '">' + esc(x.name) + ' · ' + esc(TR_NAME[x.transport] || x.transport) + '</option>';
     }).join('');
     if (cur && (SYNC.sources || []).some(function (x) { return x.id === cur; })) sel.value = cur;
+    doclLoadTypeNames();
     doclLoadTypes();
   }
   function doclCheckedList() {
@@ -18769,8 +18770,9 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   }
   function doclLoadTypes() {
     var sid = $('doclSource').value;
-    if (!sid) { doclApplyTypes([]); $('doclTypesBtn').textContent = '— нет источников —'; return; }
+    if (!sid) { IDOC_NAMES = {}; doclApplyTypes([]); $('doclTypesBtn').textContent = '— нет источников —'; return; }
     $('doclTypesBtn').textContent = '— загрузка типов… —';
+    doclLoadTypeNames();   // актуализируем понятные имена видов (IDOC_NAMES) параллельно со списком типов
     api('/api/docs/types', { source: sid }).then(function (res) {
       if (res.ok) { warnIn('doclWarn', '', ''); doclApplyTypes(res.types || []); return; }
       // Источник недоступен — показываем внутренний справочник типов (кэш панели)
@@ -18815,7 +18817,11 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     if (label === null) return;
     api('/api/docs/kind_name', { key: v.slice(5), label: label.trim() }).then(function (res) {
       if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
-      toast('Имя вида сохранено'); doclLoadTypes();
+      // сразу обновляем локальный кэш имён, чтобы IDOC_NAMES был актуален без ожидания ответа сервера
+      var gkey = v.slice(5).toLowerCase();
+      if (label.trim()) IDOC_NAMES[gkey] = label.trim(); else delete IDOC_NAMES[gkey];
+      toast('Имя вида сохранено');
+      doclLoadTypeNames().then(doclLoadTypes);   // синхронизируемся с сервером и перерисовываем список типов
     });
   };
   $('doclRun').onclick = function () {
