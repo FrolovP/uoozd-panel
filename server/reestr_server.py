@@ -2301,6 +2301,25 @@ def docs_save_raw(rows):
     write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ДОКУМЕНТЫ_1С, json.dumps(rows, ensure_ascii=False, indent=1))
 
 
+ФАЙЛ_ТИПЫ_1С = 'Панель — типы документов 1С.json'   # внутренний справочник типов документов источников
+
+
+def dtype_cache():
+    d = _json_file(ФАЙЛ_ТИПЫ_1С, {})
+    return d if isinstance(d, dict) else {}
+
+
+def dtype_cache_put(src_id, types):
+    """Запомнить типы документов источника — внутренний справочник панели:
+    понятное имя, вид объекта, поле даты, число документов вида. Нужен, чтобы
+    показывать типы пользователю, даже когда база 1С недоступна."""
+    with STORE_LOCK:
+        d = dtype_cache()
+        d[str(src_id)] = {'at': datetime.now().isoformat(timespec='seconds'),
+                          'types': (types or [])[:400]}
+        write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ТИПЫ_1С, json.dumps(d, ensure_ascii=False, indent=1))
+
+
 def _doc_kind(set_name):
     n = str(set_name or '')
     if n.startswith('Document_'):
@@ -2504,7 +2523,19 @@ def docs_api(path, data, user):
         rec = src_find(str(data.get('source') or ''))
         if not rec:
             raise ValueError('Источник не найден')
-        return {'ok': True, 'types': doc_types(rec)}
+        types = doc_types(rec)
+        try:
+            dtype_cache_put(rec.get('id'), types)
+        except Exception:
+            pass                        # кэш типов — опция, не должна ломать ответ
+        return {'ok': True, 'types': types}
+    if path == '/api/docs/types_cached':
+        sid = str(data.get('source') or '').strip()
+        d = dtype_cache()
+        if sid:
+            ent = d.get(sid) or {}
+            return {'ok': True, 'at': ent.get('at') or '', 'types': ent.get('types') or []}
+        return {'ok': True, 'sources': d}
     if path == '/api/docs/type_fields':
         rec = src_find(str(data.get('source') or ''))
         if not rec:
@@ -2572,10 +2603,14 @@ def docs_api(path, data, user):
                 'date_field': date_field, 'preview': preview}
     if path == '/api/docs/list':
         dt = str(data.get('doc_type') or '').strip()
+        dts = {str(x) for x in (data.get('doc_types') or []) if str(x).strip()} \
+            if isinstance(data.get('doc_types'), list) else set()
         date_from = str(data.get('date_from') or '').strip()
         date_to = str(data.get('date_to') or '').strip()
         rows = docs_load_raw()
-        if dt:
+        if dts:
+            rows = [r for r in rows if r.get('doc_type') in dts]
+        elif dt:
             rows = [r for r in rows if r.get('doc_type') == dt]
         if date_from:
             rows = [r for r in rows if (r.get('date') or '') >= date_from]
@@ -2587,6 +2622,13 @@ def docs_api(path, data, user):
                  | {'fields_count': len(r.get('fields') or {})} for r in rows[:limit]]
         types = sorted({r.get('doc_type') for r in docs_load_raw() if r.get('doc_type')})
         return {'ok': True, 'items': items, 'total': len(rows), 'types': types}
+    if path == '/api/docs/get':
+        uid = str(data.get('uid') or '')
+        dt = str(data.get('doc_type') or '').strip()
+        for r in docs_load_raw():
+            if r.get('uid') == uid and (not dt or r.get('doc_type') == dt):
+                return {'ok': True, 'item': r}
+        raise ValueError('Документ не найден во внутреннем хранилище')
     if path == '/api/docs/delete':
         uid = str(data.get('uid') or '')
         dt = str(data.get('doc_type') or '').strip()
@@ -2669,6 +2711,55 @@ def dmap_api(path, data, user):
         log('edit', f"Сопоставление реквизитов: {doc_type}.{src_field} → {registry}.{reg_field}",
             user=user.get('fio') or 'панель')
         return {'ok': True, 'item': rec}
+    if path == '/api/dmap/save_bulk':
+        # Массовое сохранение из формы «документ-образец»: полный набор
+        # сопоставлений типа документа заменяется тем, что прислала форма
+        # (строки без реестра = «не переносить» — снимают сопоставление).
+        doc_type = str(data.get('doc_type') or '').strip()
+        if not doc_type:
+            raise ValueError('Не указан тип документа 1С')
+        rows_in = data.get('rows')
+        if not isinstance(rows_in, list):
+            raise ValueError('rows — список сопоставлений')
+        cleaned, seen = [], set()
+        for x in rows_in[:400]:
+            if not isinstance(x, dict):
+                continue
+            src = str(x.get('src_field') or '').strip()
+            reg = str(x.get('registry') or '').strip()
+            rf = str(x.get('reg_field') or '').strip()
+            if not src or (src, reg) in seen:
+                continue
+            seen.add((src, reg))
+            if not reg:
+                continue                        # «не переносить»
+            if reg not in DMAP_REGISTRIES:
+                raise ValueError('Тип реестра — один из: ' + ', '.join(DMAP_REGISTRIES))
+            if not rf:
+                raise ValueError(f'Для реквизита «{src}» не указан реквизит реестра')
+            cleaned.append({'src_field': src[:200], 'registry': reg, 'reg_field': rf[:200]})
+        now = datetime.now().isoformat(timespec='seconds')
+        with STORE_LOCK:
+            old_rows = dmap_load_raw()
+            old_by = {(x.get('src_field'), x.get('registry')): x
+                      for x in old_rows if x.get('doc_type') == doc_type}
+            rows = [x for x in old_rows if x.get('doc_type') != doc_type]
+            for c in cleaned:
+                old = old_by.get((c['src_field'], c['registry']))
+                rid = (old or {}).get('id') or \
+                    'dm-' + hashlib.sha1(f"{doc_type}|{c['src_field']}|{c['registry']}"
+                                         .encode('utf-8')).hexdigest()[:8]
+                base, n = rid, 2
+                while any(x.get('id') == rid for x in rows):
+                    rid = f'{base}-{n}'
+                    n += 1
+                rows.append({'id': rid, 'doc_type': doc_type[:200], 'src_field': c['src_field'],
+                             'registry': c['registry'], 'reg_field': c['reg_field'],
+                             'created_at': (old or {}).get('created_at') or now, 'updated_at': now})
+            dmap_save_raw(rows)
+        log('edit', f'Сопоставление реквизитов ({doc_type}): форма-образец, строк {len(cleaned)}',
+            user=user.get('fio') or 'панель')
+        return {'ok': True, 'saved': len(cleaned)}
     if path == '/api/dmap/delete':
         rid = str(data.get('id') or '')
         rows = dmap_load_raw()
@@ -12204,7 +12295,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <div class="tablewrap"><table class="at" id="srcTable"></table></div>
     <div class="warnbox" id="srcListWarn" style="margin:8px 0 0"></div>
   </section>
-  <section class="card adm-pane" data-pane="sync" hidden>
+  <section class="card adm-pane" data-pane="sync-old" hidden>
     <h2>Сопоставление реквизитов и синхронизация <span class="muted">поля источника 1С → колонки реестра Панели; ключ — GUID строки</span></h2>
     <div class="toolbar"><span class="muted">Синхронизация обновляет найденные строки реестра значениями из 1С (пустые значения не перезаписывают, формулы не трогаются). Перед применением — предпросмотр изменений.</span><span class="grow"></span><button class="btn" id="syncExport">Экспорт в JSON</button><label class="btn" style="cursor:pointer">Импорт из JSON<input type="file" id="syncImportFile" accept=".json" hidden></label><button class="btn primary" id="mapAdd">+ Сопоставление</button></div>
     <div class="tablewrap"><table class="at" id="mapTable"></table></div>
@@ -12216,8 +12307,16 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     <h2>Загрузка документов из 1С <span class="muted">внутренние документы: выбор типа документа и периода</span></h2>
     <div class="toolbar" style="flex-wrap:wrap;gap:8px">
       <label class="muted" for="doclSource">Источник</label><select id="doclSource"></select>
-      <label class="muted" for="doclType">Тип документа</label><select id="doclType" style="min-width:240px"></select>
-      <button class="btn sm" id="doclKindRename" title="Задать понятное имя для вида внутреннего документа" hidden>✎</button>
+      <span class="muted">Типы документов</span>
+      <span style="position:relative;display:inline-block">
+        <button class="btn" id="doclTypesBtn" type="button">— выбрать типы — ▾</button>
+        <span id="doclTypesPanel" hidden style="position:absolute;z-index:40;top:calc(100% + 4px);left:0;min-width:360px;max-width:480px;max-height:320px;overflow:auto;background:#fff;border:1px solid #d8dde6;border-radius:10px;box-shadow:0 10px 28px rgba(23,32,61,.18);padding:10px 12px;text-align:left">
+          <span style="display:flex;gap:6px;align-items:center;margin-bottom:6px"><button class="btn sm" id="doclTypesAll" type="button">выбрать все</button><button class="btn sm" id="doclTypesNone" type="button">снять все</button><span class="grow"></span><span class="muted" id="doclTypesCnt"></span></span>
+          <span id="doclTypes" style="display:block"></span>
+        </span>
+      </span>
+      <select id="doclType" hidden></select>
+      <button class="btn sm" id="doclKindRename" title="Задать понятное имя для активного вида внутреннего документа" hidden>✎</button>
       <label class="muted" for="doclFrom">с</label><input type="date" id="doclFrom">
       <label class="muted" for="doclTo">по</label><input type="date" id="doclTo">
       <span class="grow"></span>
@@ -12225,12 +12324,12 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <button class="btn primary" id="doclRun">Загрузить из 1С</button>
       <button class="btn" id="doclShow">Показать загруженные</button>
     </div>
-    <div class="hint">Документы читаются из 1С постранично и складываются во внутреннее хранилище панели (ключ — тип документа + GUID). Повторная загрузка обновляет уже полученные документы, дублей не будет.</div>
+    <div class="hint">Документы читаются из 1С постранично и складываются во внутреннее хранилище панели (ключ — тип документа + GUID). Повторная загрузка обновляет уже полученные документы, дублей не будет. Можно отметить сразу несколько типов — загрузятся только они. Кнопка «⇄» у загруженного документа открывает его как образец для сопоставления реквизитов с реестрами панели.</div>
     <div class="warnbox" id="doclWarn" style="margin:8px 0 0"></div>
     <div class="muted" id="doclInfo" style="margin:6px 0"></div>
     <div class="tablewrap" style="max-height:380px;overflow:auto"><table class="at" id="doclTable"></table></div>
   </section>
-  <section class="card adm-pane" data-pane="sync" hidden>
+  <section class="card adm-pane" data-pane="sync-old" hidden>
     <h2>Сопоставление реквизитов документов <span class="muted">как реквизиты документа 1С ложатся в реестры панели</span></h2>
     <div class="toolbar"><span class="muted">Для каждого типа документа 1С укажите, какой реквизит в какую колонку какого реестра панели переносить.</span><span class="grow"></span><button class="btn primary" id="dmapAdd">+ Сопоставление реквизита</button></div>
     <div class="tablewrap"><table class="at" id="dmapTable"></table></div>
@@ -12582,6 +12681,17 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       <div class="f full"><div class="hint">Если тип документа не выбран, список реквизитов заполнится после выбора типа. Реквизит реестра можно подобрать из подсказки или вписать вручную.</div></div>
     </div>
     <div class="sheet-foot"><button class="btn" id="dmapmDelete" hidden>Удалить</button><span class="grow"></span><button class="btn primary" id="dmapmSave">Сохранить</button></div>
+  </div>
+</div>
+
+<!-- ДОКУМЕНТ-ОБРАЗЕЦ: СОПОСТАВЛЕНИЕ РЕКВИЗИТОВ ПО ЖИВОМУ ДОКУМЕНТУ 1С -->
+<div class="modal" id="dsm" role="dialog" aria-modal="true" aria-labelledby="dsmTitle">
+  <div class="sheet" style="width:min(1040px,100%)">
+    <div class="sheet-head"><h2 id="dsmTitle">Документ-образец</h2><span class="muted" id="dsmSub"></span><button class="btn x" data-close="dsm" aria-label="Закрыть">✕</button></div>
+    <div class="warnbox" id="dsmWarn"></div>
+    <div style="padding:10px 22px 0"><div class="hint">Выберите для реквизитов документа реестр панели и его реквизит — так сопоставление создаётся по живому документу. «+» — переносить один реквизит сразу в несколько реестров. Если для одного типа документа сопоставлено несколько реестров, их строки синхронизируются между собой по GUID документа 1С. Зелёным отмечены реквизиты, для которых сопоставление уже задано.</div></div>
+    <div class="tablewrap" style="max-height:430px;overflow:auto;margin:10px 22px"><table class="at" id="dsmTable"></table></div>
+    <div class="sheet-foot"><span class="grow"></span><button class="btn" data-close="dsm">Отмена</button><button class="btn primary" id="dsmSave">Сохранить сопоставления</button></div>
   </div>
 </div>
 
@@ -18118,7 +18228,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   // =====================================================================
   // ЗАГРУЗКА ДОКУМЕНТОВ ИЗ 1С (внутренние документы) — только админ
   // =====================================================================
-  var DOCS = { types: [], items: [], total: 0 };
+  var DOCS = { types: [], list: [], items: [], total: 0, checked: {}, active: '' };
   var DMAP = { items: [], registries: [], oaoCols: [], ozTables: {}, ozFields: {}, ovrkFields: [] };
 
   function doclSourceFill() {
@@ -18130,27 +18240,99 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     if (cur && (SYNC.sources || []).some(function (x) { return x.id === cur; })) sel.value = cur;
     doclLoadTypes();
   }
+  function doclCheckedList() {
+    return DOCS.list.filter(function (t) { return DOCS.checked[t.name]; }).map(function (t) { return t.name; });
+  }
+  function doclPersist() {
+    store('reestr-docl-chk-' + ($('doclSource').value || ''), JSON.stringify(doclCheckedList()));
+  }
+  function doclTypesLabel() {
+    var n = doclCheckedList().length;
+    $('doclTypesBtn').textContent = n ? ('выбрано типов: ' + n + ' ▾') : '— выбрать типы — ▾';
+    $('doclTypesCnt').textContent = DOCS.list.length ? (n + ' из ' + DOCS.list.length) : '';
+  }
+  function doclSetActive(name) {
+    DOCS.active = name || '';
+    var sel = $('doclType');
+    sel.innerHTML = DOCS.types.map(function (t) { return '<option value="' + esc(t.name) + '">' + esc(t.name) + '</option>'; }).join('');
+    sel.value = DOCS.active;
+    $('doclKindRename').hidden = !DOCS.active.startsWith('IDOC:');
+    Array.prototype.forEach.call($('doclTypes').querySelectorAll('[data-dt-row]'), function (row) {
+      var on = row.dataset.dtRow === DOCS.active;
+      row.style.background = on ? '#eef3ff' : '';
+      row.style.borderRadius = '6px';
+    });
+  }
+  function doclRenderTypes() {
+    var box = $('doclTypes');
+    if (!DOCS.list.length) {
+      box.innerHTML = '<div class="empty" style="padding:8px 4px">Типы не получены — проверьте источник.</div>';
+      doclSetActive(''); doclTypesLabel(); return;
+    }
+    box.innerHTML = DOCS.list.map(function (t) {
+      var txt = t.kind === 'внутренний документ' ? t.label : (t.name + (t.kind !== 'документ' ? ' (' + t.kind + ')' : ''));
+      var meta = (t.kind === 'внутренний документ' ? 'внутр. документ' : t.kind) +
+        (t.date_field ? ' · дата: ' + t.date_field : '') + (t.count ? ' · ~' + t.count + ' шт.' : '');
+      return '<label data-dt-row="' + esc(t.name) + '" style="display:flex;gap:8px;align-items:baseline;padding:3px 6px;cursor:pointer" title="' + esc(t.name) + '">' +
+        '<input type="checkbox" data-dt-check="' + esc(t.name) + '"' + (DOCS.checked[t.name] ? ' checked' : '') + '>' +
+        '<span style="flex:1">' + esc(txt) + '</span><span class="muted" style="font-size:11px;white-space:nowrap">' + esc(meta) + '</span></label>';
+    }).join('');
+    if (!DOCS.active || !DOCS.types.some(function (t) { return t.name === DOCS.active; })) {
+      var chk = doclCheckedList();
+      doclSetActive(chk[0] || DOCS.list[0].name);
+    } else doclSetActive(DOCS.active);
+    doclTypesLabel();
+  }
+  function doclApplyTypes(types, note) {
+    DOCS.types = types || [];
+    var docs = DOCS.types.filter(function (t) { return t.kind === 'документ' || t.kind === 'внутренний документ'; });
+    DOCS.list = docs.length ? docs : DOCS.types.slice();
+    var saved = [];
+    try { saved = JSON.parse(restore('reestr-docl-chk-' + ($('doclSource').value || '')) || '[]'); } catch (e) { saved = []; }
+    DOCS.checked = {};
+    saved.forEach(function (n) { if (DOCS.list.some(function (t) { return t.name === n; })) DOCS.checked[n] = true; });
+    doclRenderTypes();
+    if (note) warnIn('doclWarn', 'err', note);
+  }
   function doclLoadTypes() {
-    var sid = $('doclSource').value, sel = $('doclType');
-    if (!sid) { sel.innerHTML = '<option value="">— нет источников —</option>'; return; }
-    sel.innerHTML = '<option value="">— загрузка типов… —</option>';
+    var sid = $('doclSource').value;
+    if (!sid) { doclApplyTypes([]); $('doclTypesBtn').textContent = '— нет источников —'; return; }
+    $('doclTypesBtn').textContent = '— загрузка типов… —';
     api('/api/docs/types', { source: sid }).then(function (res) {
-      if (!res.ok) { sel.innerHTML = '<option value="">— ошибка —</option>'; warnIn('doclWarn', 'err', esc(res.message)); return; }
-      warnIn('doclWarn', '', '');
-      DOCS.types = res.types || [];
-      var docs = DOCS.types.filter(function (t) { return t.kind === 'документ' || t.kind === 'внутренний документ'; });
-      var list = docs.length ? docs : DOCS.types;
-      sel.innerHTML = '<option value="">— выберите тип документа —</option>' + list.map(function (t) {
-        var txt = t.kind === 'внутренний документ' ? t.label + ' (внутренний документ)'
-          : t.name + (t.kind !== 'документ' ? ' (' + t.kind + ')' : '');
-        return '<option value="' + esc(t.name) + '">' + esc(txt) + (t.date_field ? ' · дата: ' + esc(t.date_field) : '') + '</option>';
-      }).join('');
+      if (res.ok) { warnIn('doclWarn', '', ''); doclApplyTypes(res.types || []); return; }
+      // Источник недоступен — показываем внутренний справочник типов (кэш панели)
+      api('/api/docs/types_cached', { source: sid }).then(function (c) {
+        if (c.ok && (c.types || []).length) {
+          doclApplyTypes(c.types, 'Источник сейчас недоступен (' + esc(res.message) + '). Показан внутренний справочник типов панели от ' + esc((c.at || '').replace('T', ' ')) + '.');
+        } else {
+          doclApplyTypes([]);
+          warnIn('doclWarn', 'err', esc(res.message));
+        }
+      });
     });
   }
   $('doclSource').onchange = doclLoadTypes;
-  $('doclType').onchange = function () {
-    var v = this.value;
-    $('doclKindRename').hidden = !v.startsWith('IDOC:');
+  $('doclTypesBtn').onclick = function () { var p = $('doclTypesPanel'); p.hidden = !p.hidden; };
+  document.addEventListener('click', function (e) {
+    var p = $('doclTypesPanel');
+    if (p && !p.hidden && !e.target.closest('#doclTypesPanel') && !e.target.closest('#doclTypesBtn')) p.hidden = true;
+  });
+  $('doclTypesAll').onclick = function () {
+    DOCS.list.forEach(function (t) { DOCS.checked[t.name] = true; });
+    doclRenderTypes(); doclPersist();
+  };
+  $('doclTypesNone').onclick = function () {
+    DOCS.checked = {}; doclRenderTypes(); doclPersist();
+  };
+  $('doclTypes').addEventListener('change', function (e) {
+    var cb = e.target.closest('[data-dt-check]'); if (!cb) return;
+    if (cb.checked) DOCS.checked[cb.dataset.dtCheck] = true; else delete DOCS.checked[cb.dataset.dtCheck];
+    doclSetActive(cb.dataset.dtCheck);
+    doclTypesLabel(); doclPersist();
+  });
+  $('doclTypes').onclick = function (e) {
+    if (e.target.closest('input')) return;
+    var row = e.target.closest('[data-dt-row]'); if (row) doclSetActive(row.dataset.dtRow);
   };
   $('doclKindRename').onclick = function () {
     var v = $('doclType').value;
@@ -18164,39 +18346,151 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
     });
   };
   $('doclRun').onclick = function () {
-    var sid = $('doclSource').value, dt = $('doclType').value;
+    var sid = $('doclSource').value;
     if (!sid) { warnIn('doclWarn', 'err', 'Выберите источник данных 1С.'); return; }
-    if (!dt) { warnIn('doclWarn', 'err', 'Выберите тип документа 1С.'); return; }
-    warnIn('doclWarn', '', '⏳ Читаю документы из 1С…');
+    var list = doclCheckedList();
+    if (!list.length) { warnIn('doclWarn', 'err', 'Отметьте в списке типов хотя бы один тип документа 1С.'); return; }
+    var from = $('doclFrom').value, to = $('doclTo').value;
+    var tot = { read: 0, added: 0, updated: 0 }, fails = [], i = 0;
     $('doclInfo').textContent = '';
-    api('/api/docs/load', { source: sid, doc_type: dt, date_from: $('doclFrom').value, date_to: $('doclTo').value }).then(function (res) {
-      if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
-      warnIn('doclWarn', '', '✓ Прочитано из 1С: ' + res.read + ', новых: ' + res.added + ', обновлено: ' + res.updated + (res.date_field ? ' · фильтр по полю ' + esc(res.date_field) : ''));
-      toast('Документы загружены: новых ' + res.added);
-      docsShow();
-    });
+    function step() {
+      if (i >= list.length) {
+        var msg = '✓ Типов обработано: ' + list.length + ' · прочитано из 1С: ' + tot.read +
+          ', новых: ' + tot.added + ', обновлено: ' + tot.updated;
+        warnIn('doclWarn', fails.length ? 'err' : '', esc(msg) + (fails.length ? '<br>Ошибки: ' + esc(fails.join(' · ')) : ''));
+        toast('Документы загружены: новых ' + tot.added);
+        docsShow();
+        return;
+      }
+      var dt = list[i]; i += 1;
+      warnIn('doclWarn', '', '⏳ (' + i + '/' + list.length + ') Читаю «' + esc(docTypeLabel(dt)) + '» из 1С…');
+      api('/api/docs/load', { source: sid, doc_type: dt, date_from: from, date_to: to }).then(function (res) {
+        if (res.ok) { tot.read += res.read || 0; tot.added += res.added || 0; tot.updated += res.updated || 0; }
+        else fails.push(docTypeLabel(dt) + ': ' + res.message);
+        step();
+      });
+    }
+    step();
   };
   function docsShow() {
-    api('/api/docs/list', { doc_type: $('doclType').value, date_from: $('doclFrom').value, date_to: $('doclTo').value }).then(function (res) {
+    var payload = { date_from: $('doclFrom').value, date_to: $('doclTo').value };
+    var list = doclCheckedList();
+    if (list.length) payload.doc_types = list;
+    api('/api/docs/list', payload).then(function (res) {
       if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
       DOCS.items = res.items || []; DOCS.total = res.total || 0;
-      $('doclInfo').textContent = DOCS.total ? ('Во внутреннем хранилище по фильтру: ' + DOCS.total + ' (показано до ' + DOCS.items.length + ')') : '';
+      $('doclInfo').textContent = DOCS.total ? ('Во внутреннем хранилище по фильтру: ' + DOCS.total + ' (показано до ' + DOCS.items.length + ')' + (list.length ? '' : ' · типы не отмечены — показаны все')) : '';
       $('doclTable').innerHTML = '<thead><tr><th>Тип документа</th><th>Номер</th><th>Дата</th><th>Проведён</th><th>Полей</th><th>Загружен</th><th></th></tr></thead><tbody>' +
         (DOCS.items.length ? DOCS.items.map(function (d) {
           return '<tr><td class="l">' + esc(docTypeLabel(d.doc_type)) + '</td><td>' + esc(d.number || '—') + '</td><td>' + esc(d.date || '—') + '</td>' +
             '<td>' + (d.posted ? '<span class="pill ok">да</span>' : 'нет') + '</td><td>' + (d.fields_count || 0) + '</td>' +
             '<td class="muted">' + esc((d.loaded_at || '').replace('T', ' ')) + '</td>' +
-            '<td><button class="btn sm" data-docdel="' + esc(d.doc_type) + '|' + esc(d.uid) + '">✕</button></td></tr>';
-        }).join('') : '<tr><td colspan="7" class="empty">Загруженных документов пока нет — выберите источник, тип документа и период, затем «Загрузить из 1С».</td></tr>') + '</tbody>';
+            '<td style="white-space:nowrap"><button class="btn sm" data-docmap="' + esc(d.doc_type) + '|' + esc(d.uid) + '" title="Открыть документ как образец для сопоставления реквизитов">⇄</button> ' +
+            '<button class="btn sm" data-docdel="' + esc(d.doc_type) + '|' + esc(d.uid) + '">✕</button></td></tr>';
+        }).join('') : '<tr><td colspan="7" class="empty">Загруженных документов пока нет — выберите источник, отметьте типы документов и период, затем «Загрузить из 1С».</td></tr>') + '</tbody>';
     });
   }
   $('doclShow').onclick = docsShow;
   $('doclTable').onclick = function (e) {
+    var m = e.target.closest('[data-docmap]');
+    if (m) { var pm = m.dataset.docmap.split('|'); openDocSample(pm[0], pm.slice(1).join('|')); return; }
     var b = e.target.closest('[data-docdel]'); if (!b) return;
     var p = b.dataset.docdel.split('|');
     api('/api/docs/delete', { doc_type: p[0], uid: p.slice(1).join('|') }).then(function (res) {
       if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
       toast('Документ удалён из хранилища'); docsShow();
+    });
+  };
+
+  // =====================================================================
+  // ДОКУМЕНТ-ОБРАЗЕЦ: сопоставление реквизитов по живому документу 1С
+  // =====================================================================
+  var DSM = { doc: null };
+  function openDocSample(docType, uid) {
+    api('/api/docs/get', { doc_type: docType, uid: uid }).then(function (res) {
+      if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
+      DSM.doc = res.item;
+      renderDocSample();
+      openModal('dsm');
+    });
+  }
+  function dsmRegOptions(cur) {
+    return '<option value="">— не переносить —</option>' + DMAP.registries.map(function (r) {
+      return '<option value="' + esc(r) + '"' + (r === cur ? ' selected' : '') + '>' + esc(r) + '</option>';
+    }).join('');
+  }
+  function dsmRegFieldOptions(reg, cur) {
+    var cols = [], seen = {};
+    function add(h) { if (h && !seen[h]) { seen[h] = true; cols.push(h); } }
+    if (reg === 'ОАО') DMAP.oaoCols.forEach(add);
+    else if (reg === 'ОПАиЗ') Object.keys(DMAP.ozFields).forEach(function (t) {
+      (DMAP.ozFields[t] || []).forEach(function (x) { add(x.t); });
+    });
+    else if (reg === 'ОВРК') DMAP.ovrkFields.forEach(function (x) { add(x.t); });
+    if (cur && !seen[cur]) cols.unshift(cur);
+    return '<option value="">— реквизит реестра —</option>' + cols.map(function (h) {
+      return '<option value="' + esc(h) + '"' + (h === cur ? ' selected' : '') + '>' + esc(h) + '</option>';
+    }).join('');
+  }
+  function dsmRowHtml(field, value, reg, rf, clone) {
+    return '<tr data-dsm-row="' + esc(field) + '"' + (reg ? ' style="background:#f2fbf4"' : '') + '>' +
+      '<td class="l"><b>' + esc(field) + '</b> <button class="btn sm" data-dsm-add title="Переносить этот реквизит ещё в один реестр">+</button>' +
+      (clone ? ' <button class="btn sm" data-dsm-del title="Убрать строку">✕</button>' : '') + '</td>' +
+      '<td class="l muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(value) + '">' + esc(value || '—') + '</td>' +
+      '<td><select data-dsm-reg>' + dsmRegOptions(reg) + '</select></td>' +
+      '<td><select data-dsm-rf>' + dsmRegFieldOptions(reg, rf) + '</select></td></tr>';
+  }
+  function renderDocSample() {
+    var d = DSM.doc;
+    $('dsmTitle').textContent = 'Документ-образец: № ' + (d.number || '—') + ' от ' + (d.date || '—');
+    $('dsmSub').textContent = docTypeLabel(d.doc_type) + ' · GUID: ' + d.uid;
+    var by = {};
+    DMAP.items.forEach(function (m) {
+      if (m.doc_type === d.doc_type) {
+        if (!by[m.src_field]) by[m.src_field] = [];
+        by[m.src_field].push(m);
+      }
+    });
+    var names = Object.keys(d.fields || {}).sort(function (a, b) { return a.localeCompare(b, 'ru'); });
+    var html = '';
+    names.forEach(function (f) {
+      var maps = by[f] || [];
+      if (!maps.length) html += dsmRowHtml(f, d.fields[f], '', '', false);
+      else maps.forEach(function (m, i) { html += dsmRowHtml(f, d.fields[f], m.registry, m.reg_field, i > 0); });
+    });
+    $('dsmTable').innerHTML = '<thead><tr><th>Реквизит документа 1С</th><th>Данные документа</th><th>Реестр панели</th><th>Реквизит реестра</th></tr></thead><tbody>' +
+      (html || '<tr><td colspan="4" class="empty">У документа нет реквизитов.</td></tr>') + '</tbody>';
+    warnIn('dsmWarn', '', '');
+  }
+  $('dsmTable').addEventListener('change', function (e) {
+    var sel = e.target.closest('select[data-dsm-reg]'); if (!sel) return;
+    var tr = sel.closest('tr');
+    tr.querySelector('select[data-dsm-rf]').innerHTML = dsmRegFieldOptions(sel.value, '');
+    tr.style.background = sel.value ? '#f2fbf4' : '';
+  });
+  $('dsmTable').onclick = function (e) {
+    var add = e.target.closest('[data-dsm-add]');
+    if (add) {
+      var tr = add.closest('tr'), d = DSM.doc, f = tr.dataset.dsmRow;
+      tr.insertAdjacentHTML('afterend', dsmRowHtml(f, (d.fields || {})[f] || '', '', '', true));
+      return;
+    }
+    var del = e.target.closest('[data-dsm-del]');
+    if (del) del.closest('tr').remove();
+  };
+  $('dsmSave').onclick = function () {
+    if (!DSM.doc) return;
+    var rows = [];
+    Array.prototype.forEach.call($('dsmTable').querySelectorAll('tr[data-dsm-row]'), function (tr) {
+      rows.push({ src_field: tr.dataset.dsmRow,
+                  registry: tr.querySelector('[data-dsm-reg]').value,
+                  reg_field: tr.querySelector('[data-dsm-rf]').value });
+    });
+    api('/api/dmap/save_bulk', { doc_type: DSM.doc.doc_type, rows: rows }).then(function (res) {
+      if (!res.ok) { warnIn('dsmWarn', 'err', esc(res.message)); return; }
+      closeModal('dsm');
+      toast('Сопоставления сохранены: ' + res.saved);
+      loadDmap();
     });
   };
 
@@ -18328,7 +18622,7 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   $('dpmOzTable').onchange = dpmRegColsFill;
   $('doclPush').onclick = function () {
     var dt = $('doclType').value;
-    if (!dt) { warnIn('doclWarn', 'err', 'Сначала выберите тип документа и загрузите документы из 1С.'); return; }
+    if (!dt) { warnIn('doclWarn', 'err', 'Сначала кликните тип документа в списке типов (он станет активным) и загрузите документы из 1С.'); return; }
     warnIn('dpmWarn', '', '');
     $('dpmSub').textContent = 'тип документа: ' + docTypeLabel(dt) + ' · в хранилище: ' + (DOCS.total || DOCS.items.length || 0);
     var reg = $('dpmReg');
