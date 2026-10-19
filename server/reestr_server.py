@@ -1440,6 +1440,9 @@ def conn_check(base, login='', password='', ignore_cert=False, entity=''):
     if not login and password:
         res['message'] = 'Указан пароль без имени пользователя 1С — заполните оба поля или оставьте оба пустыми'
         return res
+    if login and not str(password or ''):
+        res['message'] = 'Указано имя пользователя 1С без пароля — заполните оба поля или оставьте оба пустыми'
+        return res
     try:
         note = _conn_http_probe(b, login, password, bool(ignore_cert), CONN_TEST_TIMEOUT)
     except ValueError as e:
@@ -1726,18 +1729,24 @@ def _odata_cell(v):
     if v is None:
         return ''
     if isinstance(v, dict):
-        return v.get('Description') or v.get('Value') or v.get('RefKey') or v.get('PredefinedCode') or ''
+        # ссылка OData в JSON-формате 1С: {'key_ref@odata.bind': "guid'…'"} — показываем GUID вместо {}
+        bind = next((x for x in v.values() if isinstance(x, str)), '')
+        return (v.get('Description') or v.get('Value') or v.get('RefKey') or v.get('PredefinedCode')
+                or re.sub(r"^guid'|'$", '', str(bind)))
     if isinstance(v, bool):
         return 'Да' if v else 'Нет'
     if isinstance(v, (int, float)):
         return v
     s = str(v)
-    m = re.match(r'^/Date\((-?\d+)\)/$', s)
-    if m:
+    m = re.match(r'^/Date\((-?\d+)(?:([+-]\d{4}))?\)/$', s)
+    if m:                    # формат 1С /Date(мсек[+0300])/ → местное время сервера панели
         try:
             return datetime.fromtimestamp(int(m.group(1)) / 1000).strftime('%d.%m.%Y %H:%M')
-        except (ValueError, OSError):
+        except (ValueError, OverflowError, OSError):
             return s
+    m = re.match(r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})', s)
+    if m:                  # ISO-дата (часть публикаций 1С отдаёт её вместо /Date…/) → дд.мм.гггг чч:мм
+        return f'{m.group(3)}.{m.group(2)}.{m.group(1)} {m.group(4)}'
     return s
 
 
@@ -1794,6 +1803,36 @@ def odata_api(path, data, user):
     raise ValueError('Нет такой команды 1С OData')
 
 
+def odata_xlsx_bytes(res):
+    """Результат odata_query {'columns','rows'} → байты .xlsx для выгрузки."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '1С'
+    heads = [str(c or '') for c in res.get('columns') or []]
+    ws.append(heads)
+    thin = Side(style='thin', color='CFCDC6')
+    for c in ws[1]:
+        c.font = Font(bold=True)
+        c.fill = PatternFill('solid', fgColor='FFF2CC')
+        c.alignment = Alignment(wrap_text=True, vertical='center')
+        c.border = Border(top=thin, bottom=thin, left=thin, right=thin)
+    for r in res.get('rows') or []:
+        ws.append(list(r))
+    from openpyxl.utils import get_column_letter
+    for i in range(1, len(heads) + 1):
+        w = max(len(str(heads[i - 1])), 10) + 2
+        for r in (res.get('rows') or [])[:50]:
+            if i - 1 < len(r):
+                w = max(w, min(len(str(r[i - 1] or '')), 60) + 2)
+        ws.column_dimensions[get_column_letter(i)].width = min(w, 60)
+    ws.freeze_panes = 'A2'
+    if heads:
+        ws.auto_filter.ref = f'A1:{get_column_letter(len(heads))}{max(ws.max_row, 1)}'
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # =====================================================================
 # ПОДДЕРЖКА ПРЯМОГО COM-СОЕДИНЕНИЯ С 1С УДАЛЕНА
 # Транспорт V83.COMConnector (pywin32) работал только на Windows и не мог
@@ -1837,7 +1876,6 @@ def c1_split_password(connect):
 # =====================================================================
 
 SRC_TRANSPORTS = ('odata', 'mcp')
-LEGACY_TRANSPORTS = ('com',)   # унаследованные записи (только просмотр; обращения запрещены)
 LEGACY_TRANSPORTS = ('com',)   # унаследованные записи в списке источников (только просмотр, обращения запрещены)
 
 
@@ -1939,6 +1977,7 @@ def src_norm(rec):
         p['tool_list'] = str(p.get('tool_list') or 'list_metadata_objects').strip()[:120]
         p['tool_meta'] = str(p.get('tool_meta') or 'get_metadata_structure').strip()[:120]
         p['tool_data'] = str(p.get('tool_data') or '').strip()[:120]
+        p['ignore_cert'] = bool(p.get('ignore_cert'))   # https-прокси с самоподписанным сертификатом
     rec['transport'] = t
     rec['params'] = p
     return rec
@@ -1996,6 +2035,12 @@ def src_save_last_check(sid, check):
 
 # --- MCP-транспорт: JSON-RPC вызовы к python-прокси (initialize, tools/list, tools/call) ---
 MCP_HANDSHAKE = {}    # id источника → True после успешного initialize на этом запуске сервера
+MCP_INIT_LOCKS = {}   # id источника → Lock: один handshake одновременно (иначе прокси видит два initialize)
+
+
+def _mcp_init_lock(sid):
+    with SOURCES_LOCK:
+        return MCP_INIT_LOCKS.setdefault(sid, threading.Lock())
 
 
 def mcp_ensure_init(rec):
@@ -2005,15 +2050,22 @@ def mcp_ensure_init(rec):
     sid = str(rec.get('id') or '')
     if MCP_HANDSHAKE.get(sid):
         return
-    mcp_rpc(rec, 'initialize', {
-        'protocolVersion': '2025-03-26',
-        'capabilities': {},
-        'clientInfo': {'name': 'Panel UOOZD', 'version': '14'}}, timeout=20)
-    try:   # notifications/initialized — ответ не ожидается (204), ошибка не фатальна
-        mcp_rpc(rec, 'notifications/initialized', None, timeout=10)
-    except ValueError:
-        pass
-    MCP_HANDSHAKE[sid] = True
+    with _mcp_init_lock(sid):
+        if MCP_HANDSHAKE.get(sid):     # возможно handshake уже сделал параллельный поток
+            return
+        try:
+            mcp_rpc(rec, 'initialize', {
+                'protocolVersion': '2025-03-26',
+                'capabilities': {},
+                'clientInfo': {'name': 'Panel UOOZD', 'version': '14'}}, timeout=20)
+        except Exception:
+            MCP_HANDSHAKE.pop(sid, None)
+            raise
+        try:   # notifications/initialized — ответ не ожидается (204), ошибка не фатальна
+            mcp_rpc(rec, 'notifications/initialized', None, timeout=10)
+        except ValueError:
+            pass
+        MCP_HANDSHAKE[sid] = True
 
 
 def mcp_reset(rec_or_id):
@@ -2136,7 +2188,8 @@ def src_fields(rec):
                 props = s.get('props') or []
                 break
         if props:
-            return [{'name': x.get('name'), 'label': x.get('title') or x.get('name')} for x in props]
+            return [{'name': x.get('name'), 'label': x.get('title') or x.get('name')}
+                    for x in props if x.get('name')]
         q = odata_query(_src_odata_rec(rec), top=1)      # хотя бы одна строка → колонки
         return [{'name': c, 'label': c} for c in q['columns']]
     if t == 'com':
@@ -2173,9 +2226,25 @@ def src_rows(rec, filt=None, orderby=None, top=None, skip=0, watermark=None):
             wv = str(watermark[1]).replace("'", "''")
             cond = f"{watermark[0]} gt datetime'{wv}'" if re.match(r'^\d{4}-', wv) else f"{watermark[0]} gt '{wv}'"
             f = f'({f}) and ({cond})' if f else cond
-        return odata_query(_src_odata_rec(rec), entity=p.get('entity'), filt=f or None,
-                           orderby=str(orderby if orderby is not None else (p.get('orderby') or '')) or None,
-                           top=top, skip=skip)
+        od = str(orderby if orderby is not None else (p.get('orderby') or '')) or None
+        srcrec = _src_odata_rec(rec)
+        page = int(top or p.get('top') or ODATA_PAGE)          # размер страницы; cap = сколько всего строк
+        res = odata_query(srcrec, entity=p.get('entity'), filt=f or None, orderby=od, top=page, skip=skip)
+        cols = res['columns']
+        rows = list(res['rows'])
+        total = res.get('total')
+        while top and len(rows) < int(top):                    # добираем страницы, пока не набран лимит
+            nxt = odata_query(srcrec, entity=p.get('entity'), filt=f or None, orderby=od,
+                              top=min(page, int(top) - len(rows)), skip=skip + len(rows))
+            cur = [dict(zip(cols, r)) for r in rows]           # порядок колонок мог измениться — склеиваем по именам
+            add = [list(nxt['columns'][:0]) for _ in range(0)]
+            for r in nxt['rows']:
+                d = dict(zip(nxt['columns'], r))
+                add.append([d.get(c, '') for c in cols])
+            rows += add
+            if len(nxt['rows']) < min(page, int(top) - len(rows) + len(add)) or not nxt['rows']:
+                break                                          # набор данных исчерпан
+        return {'columns': cols, 'rows': rows, 'total': total if isinstance(total, int) else len(rows) + skip}
     if t == 'com':
         raise ValueError('Транспорт прямого COM удалён из панели — источник нужно пересоздать на OData или MCP')
     # mcp
