@@ -1,0 +1,12 @@
+[
+ {
+  "login": "miranova",
+  "fio": "Миранова В.С.",
+  "dept": "ОАО",
+  "admin": true,
+  "can_delete": true,
+  "must_change": false,
+  "salt": "edd1b8972ad0061eb2dc29f8fdc1478f",
+  "hash": "2753981245cfed8cb8f7c245858de866a8e6bb4a77ade7331893edbd5cfb63ba"
+ }
+]

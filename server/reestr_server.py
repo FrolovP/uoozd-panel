@@ -1725,7 +1725,9 @@ def odata_query(rec, entity=None, filt=None, orderby=None, top=None, skip=0):
 
 
 def _odata_cell(v):
-    """Значения 1С (в т.ч. ссылки {...odata_bind}) приводим к тексту для таблицы."""
+    """Значения 1С (в т.ч. ссылки {...odata_bind}) приводим к тексту для таблицы.
+    GUID ссылок подменяем пользовательским представлением из постоянного кэша
+    guid_cache() (см. userize_value) — сетевых запросов здесь нет, только кэш."""
     if v is None:
         return ''
     if isinstance(v, dict):
@@ -1733,9 +1735,11 @@ def _odata_cell(v):
         # если представления нет; панель подменяет такие GUID пользовательскими
         # именами (resolve_doc_refs / doc_refs_map) — голый GUID доменным значением не считаем
         bind = next((x for x in v.values() if isinstance(x, str)), '')
-        return (v.get('Description') or v.get('Наименование') or v.get('Value') or v.get('Ref_Key')
-                or v.get('RefKey') or v.get('PredefinedCode')
-                or re.sub(r"^guid'|'$", '', str(bind)))
+        txt = (v.get('Description') or v.get('Наименование') or v.get('Value') or v.get('Ref_Key')
+               or v.get('RefKey') or v.get('PredefinedCode')
+               or re.sub(r"^guid'|'$", '', str(bind)))
+        # Guid из @odata.bind — тоже ссылка: отдаём представление из кэша панели
+        return userize_value(str(txt))
     if isinstance(v, bool):
         return 'Да' if v else 'Нет'
     if isinstance(v, (int, float)):
@@ -1750,7 +1754,7 @@ def _odata_cell(v):
     m = re.match(r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})', s)
     if m:                  # ISO-дата (часть публикаций 1С отдаёт её вместо /Date…/) → дд.мм.гггг чч:мм
         return f'{m.group(3)}.{m.group(2)}.{m.group(1)} {m.group(4)}'
-    return s
+    return userize_value(s)
 
 
 def odata_api(path, data, user):
@@ -2370,6 +2374,9 @@ def idoc_names():
 # было доступно и в /api/docs/list, и при переносе в реестры.
 IDOC_TYPES_TTL = 3600   # секунд; устаревший кэш обновляется лениво
 _idoc_types_cache = {}  # src_id -> {'at': datetime, 'names': {guid_нижн.: имя}}
+# Служебный ключ '*' — объединённый словарь имён видов по всем источникам:
+# подмешивается в idoc_types_cached(), чтобы имя вида находилось даже когда
+# GUID встречен вне своего источника (например, из постоянного кэша guid_cache).
 
 
 def _idoc_type_title(j):
@@ -2479,6 +2486,7 @@ def dtype_cache_put(src_id, types):
 
 # --- Представления ссылок 1С: GUID → пользовательское значение ---------------
 ФАЙЛ_GUID_1С = 'Панель — представления GUID 1С.json'
+ФАЙЛ_ЛЕЙБЛЫ_РЕКВИЗИТОВ = 'Панель — имена реквизитов 1С.json'   # источник|тип → {поле: синоним}
 _GUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 _GUID_EMPTY = '00000000-0000-0000-0000-000000000000'
 _PRESENT_KEYS = ('Description', 'Наименование', 'Name', 'FullName', 'ПолнНаименование', 'Заголовок', 'Title')
@@ -2531,7 +2539,126 @@ def guid_present(rec, entity, guid):
         return ''                       # сеть/права/удалённый объект — не кэшируем, попробуем позже
     if text:
         guid_cache_put(entity, guid, text)
+        if entity:
+            guid_cache_put('', guid, text)   # общий ключ — для userize_value и doc_refs_map
     return text
+
+
+# --- Единый слой «пользовательских данных»: GUID → представление --------------
+# Везде, где значения из 1С показываются пользователю или уходят в реестры,
+# технические ссылки (GUID, e1cib/data URLs, <uid>…) подменяются понятными
+# данными. Приоритет имён видов документов 1С:ДО: локальные псевдонимы панели →
+# OData-кэш справочника видов → постоянный кэш представлений guid_cache().
+# Сетевых запросов здесь нет — только кэши (резолв по сети делают
+# guid_present / resolve_doc_refs / doc_refs_map).
+
+_GUID_ANY_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                          r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+_IDOC_KEY_RE = re.compile(r'^IDOC:([0-9a-fA-F-]{36})$')
+_E1CIB_RE = re.compile(r'e1cib/(?:data|binary)/[^"\s<>]*\?ref=<([0-9a-fA-F-]{36})>', re.I)
+
+
+def _userized_guid(g):
+    """GUID объекта → представление из кэша панели ('' если неизвестно)."""
+    s = str(g or '').strip()
+    if not s or not _GUID_RE.match(s) or s.lower() == _GUID_EMPTY:
+        return ''
+    key = '|' + s.lower()
+    cached = guid_cache()
+    t = cached.get(key)
+    if t:
+        return t
+    for ent in ('Catalog_ВидыВнутреннихДокументов', 'Справочник.ВидыВнутреннихДокументов'):
+        t = cached.get(f'{ent}|{s.lower()}')
+        if t:
+            return t
+    return idoc_names().get(s.lower(), '')
+
+
+def userize_value(v):
+    """Значение из 1С → пользовательское: голые GUID и e1cib-ссылки подменяются
+    представлениями из кэшей панели; неизвестный GUID остаётся как есть
+    (его покажет форма-образец с подсказкой, а пакетный резолв дообогатит)."""
+    if v is None or isinstance(v, (bool, int, float)):
+        return v
+    s = str(v)
+    t = _userized_guid(s)
+    if t:
+        return t
+    if 'e1cib/' in s and '<' in s:              # ссылка вида ...?ref=<guid>
+        def _sub(m):
+            return _userized_guid(m.group(1)) or m.group(0)
+        return _E1CIB_RE.sub(_sub, s)
+    return s
+
+
+def userize_fields(fields):
+    """Все реквизиты документа/строки источника → пользовательские значения."""
+    return {k: userize_value(v) for k, v in (fields or {}).items()}
+
+
+def doc_type_user_label(doc_type, label=''):
+    """Тип 'IDOC:<GUID вида>' → понятное имя вида (без суффикса); обычный тип — как есть."""
+    m = _IDOC_KEY_RE.match(str(doc_type or ''))
+    if not m:
+        return str(label or doc_type or '')
+    g = m.group(1).lower()
+    return str(label or '') or idoc_names().get(g, '') or _userized_guid(m.group(1)) \
+        or (_idoc_types_cache.get('*') or {}).get('names', {}).get(g, '')
+
+
+def dsm_field_labels(rec, doc_type):
+    """Имена реквизитов источника → синонимы из $metadata (пользовательские
+    заголовки вместо технических имён вида «Организация_Key»). Пустой словарь —
+    если метаданные недоступны (тогда UI показывает исходные имена)."""
+    key = f"{rec.get('id') or ''}|{doc_type}"
+    with STORE_LOCK:
+        d = _json_file(ФАЙЛ_ЛЕЙБЛЫ_РЕКВИЗИТОВ, {})
+        ent = d.get(key)
+        if isinstance(ent, dict) and ent.get('at'):
+            try:
+                fresh = (datetime.now() - datetime.fromisoformat(ent['at'])).total_seconds() < 86400
+            except ValueError:
+                fresh = False
+            if fresh:
+                return dict(ent.get('map') or {})
+    p = rec.get('params') or {}
+    title_of = {}
+    try:
+        if rec.get('transport') == 'odata':
+            probe = {'base': p.get('base'), 'login': p.get('login'),
+                     'password': p.get('password'), 'ignore_cert': p.get('ignore_cert')}
+            ent_name = IDOC_ENTITY if str(doc_type).startswith(IDOC_PREFIX) else str(doc_type)
+            for s in odata_service_info(probe):
+                if s.get('name') == ent_name:
+                    for x in (s.get('props') or []):
+                        nm, tt = x.get('name'), str(x.get('title') or '').strip()
+                        if nm and tt and tt != nm:
+                            title_of[str(nm)] = tt[:120]
+                    break
+        else:
+            obj = str(p.get('metadata_object') or '').strip()
+            if obj:
+                res = mcp_tool_call(rec, p.get('tool_meta'), {'ObjectName': obj})
+                flds = (res.get('Fields') or res.get('fields') or
+                        res.get('Properties') or res.get('properties') or []) if isinstance(res, dict) else []
+                for f in flds:
+                    if isinstance(f, dict):
+                        nm = f.get('Name') or f.get('name') or ''
+                        tt = str(f.get('Description') or f.get('Synonym') or
+                                 f.get('description') or '').strip()
+                        if nm and tt and tt != nm:
+                            title_of[str(nm)] = tt[:120]
+    except Exception:
+        pass                        # метаданные недоступны — обойдёмся техническими именами
+    with STORE_LOCK:
+        d = _json_file(ФАЙЛ_ЛЕЙБЛЫ_РЕКВИЗИТОВ, {})
+        if not isinstance(d, dict):
+            d = {}
+        d[key] = {'at': datetime.now().isoformat(timespec='seconds'), 'map': title_of}
+        write_atomic(ПАПКА_ПАНЕЛИ / ФАЙЛ_ЛЕЙБЛЫ_РЕКВИЗИТОВ,
+                     json.dumps(d, ensure_ascii=False, indent=1))
+    return dict(title_of)
 
 
 # Типовые соответствия «реквизит-ссылка → набор OData» для 1С:Документооборот
@@ -3027,7 +3154,27 @@ def docs_api(path, data, user):
                 if str(item.get('doc_type') or '').startswith(IDOC_PREFIX) \
                         and not item.get('doc_type_label'):
                     item['doc_type_label'] = idoc_types_for_doc(item)
-                return {'ok': True, 'item': item, 'resolved': resolved, 'degraded': degraded}
+                # пользовательский слой: значения-ссылки (GUID/e1cib) подменяем
+                # представлениями из кэшей панели, технические имена реквизитов —
+                # синонимами из $metadata; исходные значения остаются в raw_fields
+                raw_fields = dict(item.get('fields') or {})
+                labels = {}
+                lblrec = _src_odata_rec(sr) if (sr and sr.get('transport') == 'odata') else sr
+                if not lblrec:
+                    lblrec = {'id': r.get('source') or '', 'transport': 'odata',
+                              'params': {}, 'name': ''}   # только чтение постоянного кэша синонимов
+                try:
+                    labels = dsm_field_labels(lblrec, r.get('doc_type') or '')
+                except Exception:
+                    labels = {}
+                userized = userize_fields(raw_fields)
+                for f, t in resolved.items():
+                    if t:
+                        userized[f] = t
+                item['raw_fields'] = raw_fields
+                item['fields'] = {labels.get(k, k): v for k, v in userized.items()}
+                return {'ok': True, 'item': item, 'resolved': resolved,
+                        'labels': labels, 'degraded': degraded}
         raise ValueError('Документ не найден во внутреннем хранилище')
     if path == '/api/docs/delete':
         uid = str(data.get('uid') or '')
@@ -3086,9 +3233,17 @@ def idoc_types_for_doc(doc):
 
 
 def dmap_label_rows():
-    """Строки dmap с добавленным doc_type_label — чтобы UI показывал понятный
-    тип документа даже когда список типов источника (DOCS.types) пуст."""
+    """Строки dmap с добавленными doc_type_label и src_field_label — чтобы UI
+    показывал понятный тип документа (даже когда DOCS.types пуст) и синоним
+    реквизита из $metadata вместо технического имени вида «Организация_Key»."""
     rows = dmap_load_raw()
+    labels_by_key = _json_file(ФАЙЛ_ЛЕЙБЛЫ_РЕКВИЗИТОВ, {})
+    # реквизиты хранятся без id источника — берём его из первого документа этого типа
+    src_by_type = {}
+    for r in docs_load_raw():
+        dt0 = str(r.get('doc_type') or '')
+        if dt0 and dt0 not in src_by_type and r.get('source'):
+            src_by_type[dt0] = str(r.get('source'))
     out = []
     for x in rows:
         y = dict(x)
@@ -3096,6 +3251,15 @@ def dmap_label_rows():
         if str(x.get('doc_type') or '').startswith(IDOC_PREFIX):
             lbl = idoc_names().get(x['doc_type'][len(IDOC_PREFIX):].lower(), '')
         y['doc_type_label'] = lbl
+        sf = str(x.get('src_field') or '')
+        sl = ''
+        try:
+            key = f"{src_by_type.get(str(x.get('doc_type') or ''), '')}|{x.get('doc_type') or ''}"
+            ent = labels_by_key.get(key)
+            sl = str(((ent or {}).get('map') or {}).get(sf) or '')
+        except Exception:
+            sl = ''
+        y['src_field_label'] = sl or sf
         out.append(y)
     return out
 
@@ -18884,17 +19048,42 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   // =====================================================================
   // ДОКУМЕНТ-ОБРАЗЕЦ: сопоставление реквизитов по живому документу 1С
   // =====================================================================
-  var DSM = { doc: null, resolved: {} };
+  var DSM = { doc: null, resolved: {}, degraded: false };
   function openDocSample(docType, uid) {
     warnIn('doclWarn', '', '⏳ Открываю документ, запрашиваю представления ссылок из 1С…');
+    DSM.pendingRefs = [];
     api('/api/docs/get', { doc_type: docType, uid: uid }).then(function (res) {
       if (!res.ok) { warnIn('doclWarn', 'err', esc(res.message)); return; }
       warnIn('doclWarn', '', '');
       DSM.doc = res.item;
       DSM.resolved = res.resolved || {};
+      DSM.degraded = !!res.degraded;
       renderDocSample();
       openModal('dsm');
+      if (DSM.degraded) {
+        warnIn('dsmWarn', '', '⚠️ 1С недоступна: показаны исходные значения из хранилища'
+             + ' (часть реквизитов-ссылок отображается GUID). Значения обновятся автоматически,'
+             + ' когда соединение с 1С восстановится.');
+      }
+      dsmRetryRefs();
     });
+  }
+  // мягкая повторная попытка: если остались неразрешённые GUID при недоступной 1С,
+  // через несколько секунд переспрашиваем /api/docs/get (сервер использует кэш)
+  function dsmRetryRefs() {
+    if (!DSM.degraded || !DSM.doc) return;
+    setTimeout(function () {
+      if (!DSM.doc || !$('dsm') || $('dsm').classList.contains('hidden')) return;
+      api('/api/docs/get', { doc_type: DSM.doc.doc_type, uid: DSM.doc.uid }).then(function (res) {
+        if (!res.ok || !DSM.doc) return;
+        if (res.degraded) { dsmRetryRefs(); return; }   // 1С всё ещё недоступна
+        DSM.doc = res.item;
+        DSM.resolved = res.resolved || {};
+        DSM.degraded = false;
+        renderDocSample();
+        warnIn('dsmWarn', '', '✅ Соединение с 1С восстановлено — ссылки показаны пользовательскими значениями.');
+      });
+    }, 8000);
   }
   function dsmRegOptions(cur) {
     return '<option value="">— не переносить —</option>' + DMAP.registries.map(function (r) {
@@ -18916,16 +19105,28 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   }
   function dsmRowHtml(field, value, reg, rf, clone, raw) {
     var tip = (raw && raw !== value) ? (value + '  ·  ' + raw) : value;
+    var guidCell = _dsmIsGuid(value);               // неразрешённая ссылка — видно пользователю
+    var cellStyle = guidCell ? ';color:#b25a00' : '';
     return '<tr data-dsm-row="' + esc(field) + '"' + (reg ? ' style="background:#f2fbf4"' : '') + '>' +
       '<td class="l"><b>' + esc(field) + '</b> <button class="btn sm" data-dsm-add title="Переносить этот реквизит ещё в один реестр">+</button>' +
       (clone ? ' <button class="btn sm" data-dsm-del title="Убрать строку">✕</button>' : '') + '</td>' +
-      '<td class="l muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(tip) + '">' + esc(value || '—') + '</td>' +
+      '<td class="l muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' + cellStyle + '" title="' + esc(guidCell ? 'Ссылка на объект 1С (представление ещё не получено)' : tip) + '">' + esc(value || '—') + '</td>' +
       '<td><select data-dsm-reg>' + dsmRegOptions(reg) + '</select></td>' +
       '<td><select data-dsm-rf>' + dsmRegFieldOptions(reg, rf) + '</select></td></tr>';
   }
   function dsmValue(f) {
-    var d = DSM.doc, raw = ((d.fields || {})[f] || '');
-    return { v: DSM.resolved[f] || raw, raw: raw };
+    // fields — пользовательские значения (резолв GUID + подмена из кэшей панели),
+    // raw_fields — исходные технические значения (для подсказки в ячейке)
+    var d = DSM.doc, v = ((d.fields || {})[f] || '');
+    var raw = ((d.raw_fields || {})[f] || v);
+    if (!DSM.resolved[f] && !DSM.degraded && _dsmIsGuid(raw) &&
+        DSM.pendingRefs.indexOf(f) < 0) {
+      DSM.pendingRefs.push(f);            // пакетный резолв дозапросим один раз
+    }
+    return { v: DSM.resolved[f] || v, raw: raw };
+  }
+  function _dsmIsGuid(s) {
+    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(s || '').trim());
   }
   function renderDocSample() {
     var d = DSM.doc;
@@ -18946,6 +19147,9 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
       if (!maps.length) html += dsmRowHtml(f, val.v, '', '', false, val.raw);
       else maps.forEach(function (m, i) { html += dsmRowHtml(f, val.v, m.registry, m.reg_field, i > 0, val.raw); });
     });
+    var unres = [];
+    names.forEach(function (f) { var v = dsmValue(f); if (!v.v || _dsmIsGuid(v.v)) unres.push(f); });
+    DSM.pendingRefs = unres;
     $('dsmTable').innerHTML = '<thead><tr><th>Реквизит документа 1С</th><th>Данные документа</th><th>Реестр панели</th><th>Реквизит реестра</th></tr></thead><tbody>' +
       (html || '<tr><td colspan="4" class="empty">У документа нет реквизитов.</td></tr>') + '</tbody>';
     warnIn('dsmWarn', '', '');
@@ -18974,6 +19178,16 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
                   registry: tr.querySelector('[data-dsm-reg]').value,
                   reg_field: tr.querySelector('[data-dsm-rf]').value });
     });
+    // в сопоставлении храним технические имена реквизитов источника: сервер
+    // подменил заголовки синонимами ($metadata) — возвращаем исходные имена
+    var rf = DSM.doc.raw_fields || {}, flds = DSM.doc.fields || {};
+    if (!Object.keys(rf).length) { /* нет исходных полей — оставляем имена как есть */ }
+    var inv = {};                                   // синоним/имя → техимя реквизита
+    Object.keys(flds).forEach(function (lbl) {
+      if (rf[lbl] !== undefined) { inv[lbl] = lbl; return; }        // имя не менялось
+      for (var k in rf) { if (flds[k] === lbl) { inv[lbl] = k; break; } }
+    });
+    rows.forEach(function (r) { if (inv[r.src_field]) r.src_field = inv[r.src_field]; });
     api('/api/dmap/save_bulk', { doc_type: DSM.doc.doc_type, rows: rows }).then(function (res) {
       if (!res.ok) { warnIn('dsmWarn', 'err', esc(res.message)); return; }
       closeModal('dsm');
@@ -18996,7 +19210,8 @@ table.pv tr.tot td, table.pv td.tot { font-weight: 700; background: var(--surfac
   function renderDmapTable() {
     $('dmapTable').innerHTML = '<thead><tr><th>Тип документа 1С</th><th>Реквизит документа 1С</th><th>Тип реестра панели</th><th>Реквизит реестра панели</th><th></th></tr></thead><tbody>' +
       (DMAP.items.length ? DMAP.items.map(function (m) {
-        return '<tr><td class="l"><b>' + esc(docTypeLabel(m.doc_type)) + '</b></td><td class="l">' + esc(m.src_field) + '</td>' +
+        var fl = m.src_field_label || m.src_field;
+        return '<tr><td class="l"><b>' + esc(docTypeLabel(m.doc_type)) + '</b></td><td class="l" title="' + esc(fl !== m.src_field ? m.src_field : '') + '">' + esc(fl) + '</td>' +
           '<td><span class="pill">' + esc(m.registry) + '</span></td><td class="l">' + esc(m.reg_field) + '</td>' +
           '<td style="white-space:nowrap"><button class="btn sm" data-dmapedit="' + esc(m.id) + '">Изменить</button> ' +
           '<button class="btn sm" data-dmapdel="' + esc(m.id) + '">✕</button></td></tr>';
